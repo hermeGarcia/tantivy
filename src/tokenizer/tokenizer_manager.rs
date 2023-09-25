@@ -19,20 +19,12 @@ use crate::tokenizer::{
 ///  * `en_stem` : Like `default`, but also applies stemming on the
 ///  resulting tokens. Stemming can improve the recall of your
 ///  search engine.
-/// * `whitespace` : Splits the text on whitespaces.
 #[derive(Clone)]
 pub struct TokenizerManager {
     tokenizers: Arc<RwLock<HashMap<String, TextAnalyzer>>>,
 }
 
 impl TokenizerManager {
-    /// Creates an empty tokenizer manager.
-    pub fn new() -> Self {
-        Self {
-            tokenizers: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
     /// Registers a new tokenizer associated with a given name.
     pub fn register<T>(&self, tokenizer_name: &str, tokenizer: T)
     where TextAnalyzer: From<T> {
@@ -56,25 +48,28 @@ impl TokenizerManager {
 impl Default for TokenizerManager {
     /// Creates an `TokenizerManager` prepopulated with
     /// the default pre-configured tokenizers of `tantivy`.
+    /// - simple
+    /// - en_stem
+    /// - ja
     fn default() -> TokenizerManager {
-        let manager = TokenizerManager::new();
-        manager.register("raw", RawTokenizer::default());
+        let manager = TokenizerManager {
+            tokenizers: Arc::new(RwLock::new(HashMap::new())),
+        };
+        manager.register("raw", RawTokenizer);
         manager.register(
             "default",
-            TextAnalyzer::builder(SimpleTokenizer::default())
+            TextAnalyzer::from(SimpleTokenizer)
                 .filter(RemoveLongFilter::limit(40))
-                .filter(LowerCaser)
-                .build(),
+                .filter(LowerCaser),
         );
         manager.register(
             "en_stem",
-            TextAnalyzer::builder(SimpleTokenizer::default())
+            TextAnalyzer::from(SimpleTokenizer)
                 .filter(RemoveLongFilter::limit(40))
                 .filter(LowerCaser)
-                .filter(Stemmer::new(Language::English))
-                .build(),
+                .filter(Stemmer::new(Language::English)),
         );
-        manager.register("whitespace", WhitespaceTokenizer::default());
+        manager.register("whitespace", WhitespaceTokenizer);
         manager
     }
 }

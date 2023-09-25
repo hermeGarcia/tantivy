@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use super::boolean_weight::BooleanWeight;
-use crate::query::{EnableScoring, Occur, Query, SumWithCoordsCombiner, TermQuery, Weight};
+use crate::query::{Occur, Query, TermQuery, Weight};
 use crate::schema::{IndexRecordOption, Term};
+use crate::Searcher;
 
 /// The boolean query returns a set of documents
 /// that matches the Boolean combination of constituent subqueries.
@@ -8,11 +11,11 @@ use crate::schema::{IndexRecordOption, Term};
 /// The documents matched by the boolean query are
 /// those which
 /// * match all of the sub queries associated with the
-/// `Must` occurrence
+/// `Must` occurence
 /// * match none of the sub queries associated with the
-/// `MustNot` occurrence.
-/// * match at least one of the sub queries associated
-/// with the `Must` or `Should` occurrence.
+/// `MustNot` occurence.
+/// * match at least one of the subqueries that is not
+/// a `MustNot` occurence.
 ///
 ///
 /// You can combine other query types and their `Occur`ances into one `BooleanQuery`
@@ -32,7 +35,7 @@ use crate::schema::{IndexRecordOption, Term};
 ///    let schema = schema_builder.build();
 ///    let index = Index::create_in_ram(schema);
 ///    {
-///        let mut index_writer = index.writer(15_000_000)?;
+///        let mut index_writer = index.writer(3_000_000)?;
 ///        index_writer.add_document(doc!(
 ///            title => "The Name of the Wind",
 ///        ))?;
@@ -142,22 +145,20 @@ impl From<Vec<(Occur, Box<dyn Query>)>> for BooleanQuery {
 }
 
 impl Query for BooleanQuery {
-    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+    fn weight(&self, searcher: &Searcher, scoring_enabled: bool) -> crate::Result<Box<dyn Weight>> {
         let sub_weights = self
             .subqueries
             .iter()
-            .map(|(occur, subquery)| Ok((*occur, subquery.weight(enable_scoring)?)))
+            .map(|&(ref occur, ref subquery)| {
+                Ok((*occur, subquery.weight(searcher, scoring_enabled)?))
+            })
             .collect::<crate::Result<_>>()?;
-        Ok(Box::new(BooleanWeight::new(
-            sub_weights,
-            enable_scoring.is_scoring_enabled(),
-            Box::new(SumWithCoordsCombiner::default),
-        )))
+        Ok(Box::new(BooleanWeight::new(sub_weights, scoring_enabled)))
     }
 
-    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+    fn query_terms(&self, terms: &mut BTreeMap<Term, bool>) {
         for (_occur, subquery) in &self.subqueries {
-            subquery.query_terms(visitor);
+            subquery.query_terms(terms);
         }
     }
 }

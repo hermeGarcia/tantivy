@@ -1,10 +1,8 @@
-use std::borrow::Cow;
-use std::mem;
-
 use rust_stemmers::{self, Algorithm};
 use serde::{Deserialize, Serialize};
 
-use super::{Token, TokenFilter, TokenStream, Tokenizer};
+use super::{Token, TokenFilter, TokenStream};
+use crate::tokenizer::BoxTokenStream;
 
 /// Available stemmer languages.
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Copy, Clone)]
@@ -56,7 +54,7 @@ impl Language {
     }
 }
 
-/// `Stemmer` token filter. Several languages are supported, see [`Language`] for the available
+/// `Stemmer` token filter. Several languages are supported, see `Language` for the available
 /// languages.
 /// Tokens are expected to be lowercased beforehand.
 #[derive(Clone)]
@@ -65,7 +63,7 @@ pub struct Stemmer {
 }
 
 impl Stemmer {
-    /// Creates a new `Stemmer` [`TokenFilter`] for a given language algorithm.
+    /// Creates a new Stemmer `TokenFilter` for a given language algorithm.
     pub fn new(language: Language) -> Stemmer {
         Stemmer {
             stemmer_algorithm: language.algorithm(),
@@ -74,63 +72,36 @@ impl Stemmer {
 }
 
 impl Default for Stemmer {
-    /// Creates a new `Stemmer` [`TokenFilter`] for [`Language::English`].
+    /// Creates a new Stemmer `TokenFilter` for English.
     fn default() -> Self {
         Stemmer::new(Language::English)
     }
 }
 
 impl TokenFilter for Stemmer {
-    type Tokenizer<T: Tokenizer> = StemmerFilter<T>;
-
-    fn transform<T: Tokenizer>(self, tokenizer: T) -> StemmerFilter<T> {
-        StemmerFilter {
-            stemmer_algorithm: self.stemmer_algorithm,
-            inner: tokenizer,
-        }
+    fn transform<'a>(&self, token_stream: BoxTokenStream<'a>) -> BoxTokenStream<'a> {
+        let inner_stemmer = rust_stemmers::Stemmer::create(self.stemmer_algorithm);
+        BoxTokenStream::from(StemmerTokenStream {
+            tail: token_stream,
+            stemmer: inner_stemmer,
+        })
     }
 }
 
-#[derive(Clone)]
-pub struct StemmerFilter<T> {
-    stemmer_algorithm: Algorithm,
-    inner: T,
-}
-
-impl<T: Tokenizer> Tokenizer for StemmerFilter<T> {
-    type TokenStream<'a> = StemmerTokenStream<T::TokenStream<'a>>;
-
-    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
-        let stemmer = rust_stemmers::Stemmer::create(self.stemmer_algorithm);
-        StemmerTokenStream {
-            tail: self.inner.token_stream(text),
-            stemmer,
-            buffer: String::new(),
-        }
-    }
-}
-
-pub struct StemmerTokenStream<T> {
-    tail: T,
+pub struct StemmerTokenStream<'a> {
+    tail: BoxTokenStream<'a>,
     stemmer: rust_stemmers::Stemmer,
-    buffer: String,
 }
 
-impl<T: TokenStream> TokenStream for StemmerTokenStream<T> {
+impl<'a> TokenStream for StemmerTokenStream<'a> {
     fn advance(&mut self) -> bool {
         if !self.tail.advance() {
             return false;
         }
-        let token = self.tail.token_mut();
-        let stemmed_str = self.stemmer.stem(&token.text);
-        match stemmed_str {
-            Cow::Owned(stemmed_str) => token.text = stemmed_str,
-            Cow::Borrowed(stemmed_str) => {
-                self.buffer.clear();
-                self.buffer.push_str(stemmed_str);
-                mem::swap(&mut token.text, &mut self.buffer);
-            }
-        }
+        // TODO remove allocation
+        let stemmed_str: String = self.stemmer.stem(&self.token().text).into_owned();
+        self.token_mut().text.clear();
+        self.token_mut().text.push_str(&stemmed_str);
         true
     }
 

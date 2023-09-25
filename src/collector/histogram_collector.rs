@@ -1,11 +1,8 @@
-use std::sync::Arc;
-
-use columnar::ColumnValues;
 use fastdivide::DividerU64;
 
 use crate::collector::{Collector, SegmentCollector};
-use crate::fastfield::{FastFieldNotAvailableError, FastValue};
-use crate::schema::Type;
+use crate::fastfield::{DynamicFastFieldReader, FastFieldReader, FastValue};
+use crate::schema::{Field, Type};
 use crate::{DocId, Score};
 
 /// Histogram builds an histogram of the values of a fastfield for the
@@ -28,7 +25,7 @@ pub struct HistogramCollector {
     min_value: u64,
     num_buckets: usize,
     divider: DividerU64,
-    field: String,
+    field: Field,
 }
 
 impl HistogramCollector {
@@ -37,7 +34,7 @@ impl HistogramCollector {
     /// The scale/range of the histogram is not dynamic. It is required to
     /// define it by supplying following parameter:
     ///  - `min_value`: the minimum value that can be recorded in the histogram.
-    ///  - `bucket_width`: the length of the interval that is associated with each buckets.
+    ///  - `bucket_width`: the length of the interval that is associated to each buckets.
     ///  - `num_buckets`: The overall number of buckets.
     ///
     /// Together, this parameters define a partition of `[min_value, min_value + num_buckets *
@@ -46,7 +43,7 @@ impl HistogramCollector {
     /// # Disclaimer
     /// This function panics if the field given is of type f64.
     pub fn new<TFastValue: FastValue>(
-        field: String,
+        field: Field,
         min_value: TFastValue,
         bucket_width: u64,
         num_buckets: usize,
@@ -75,7 +72,8 @@ impl HistogramComputer {
             return;
         }
         let delta = value - self.min_value;
-        let bucket_id: usize = self.divider.divide(delta) as usize;
+        let delta_u64 = delta.to_u64();
+        let bucket_id: usize = self.divider.divide(delta_u64) as usize;
         if bucket_id < self.counts.len() {
             self.counts[bucket_id] += 1;
         }
@@ -87,14 +85,14 @@ impl HistogramComputer {
 }
 pub struct SegmentHistogramCollector {
     histogram_computer: HistogramComputer,
-    column_u64: Arc<dyn ColumnValues<u64>>,
+    ff_reader: DynamicFastFieldReader<u64>,
 }
 
 impl SegmentCollector for SegmentHistogramCollector {
     type Fruit = Vec<u64>;
 
     fn collect(&mut self, doc: DocId, _score: Score) {
-        let value = self.column_u64.get_val(doc);
+        let value = self.ff_reader.get(doc);
         self.histogram_computer.add_value(value);
     }
 
@@ -112,18 +110,14 @@ impl Collector for HistogramCollector {
         _segment_local_id: crate::SegmentOrdinal,
         segment: &crate::SegmentReader,
     ) -> crate::Result<Self::Child> {
-        let column_opt = segment.fast_fields().u64_lenient(&self.field)?;
-        let (column, _column_type) = column_opt.ok_or_else(|| FastFieldNotAvailableError {
-            field_name: self.field.clone(),
-        })?;
-        let column_u64 = column.first_or_default_col(0u64);
+        let ff_reader = segment.fast_fields().u64_lenient(self.field)?;
         Ok(SegmentHistogramCollector {
             histogram_computer: HistogramComputer {
                 counts: vec![0; self.num_buckets],
                 min_value: self.min_value,
                 divider: self.divider,
             },
-            column_u64,
+            ff_reader,
         })
     }
 
@@ -158,9 +152,9 @@ mod tests {
     use query::AllQuery;
 
     use super::{add_vecs, HistogramCollector, HistogramComputer};
+    use crate::chrono::{TimeZone, Utc};
     use crate::schema::{Schema, FAST};
-    use crate::time::{Date, Month};
-    use crate::{doc, query, DateTime, Index};
+    use crate::{doc, query, Index};
 
     #[test]
     fn test_add_histograms_simple() {
@@ -215,13 +209,13 @@ mod tests {
     #[test]
     fn test_no_segments() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
-        schema_builder.add_u64_field("val_field", FAST);
+        let val_field = schema_builder.add_u64_field("val_field", FAST);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         let reader = index.reader()?;
         let searcher = reader.searcher();
         let all_query = AllQuery;
-        let histogram_collector = HistogramCollector::new("val_field".to_string(), 0u64, 2, 5);
+        let histogram_collector = HistogramCollector::new(val_field, 0u64, 2, 5);
         let histogram = searcher.search(&all_query, &histogram_collector)?;
         assert_eq!(histogram, vec![0; 5]);
         Ok(())
@@ -233,7 +227,7 @@ mod tests {
         let val_field = schema_builder.add_i64_field("val_field", FAST);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut writer = index.writer_for_tests()?;
+        let mut writer = index.writer_with_num_threads(1, 4_000_000)?;
         writer.add_document(doc!(val_field=>12i64))?;
         writer.add_document(doc!(val_field=>-30i64))?;
         writer.add_document(doc!(val_field=>-12i64))?;
@@ -242,8 +236,7 @@ mod tests {
         let reader = index.reader()?;
         let searcher = reader.searcher();
         let all_query = AllQuery;
-        let histogram_collector =
-            HistogramCollector::new("val_field".to_string(), -20i64, 10u64, 4);
+        let histogram_collector = HistogramCollector::new(val_field, -20i64, 10u64, 4);
         let histogram = searcher.search(&all_query, &histogram_collector)?;
         assert_eq!(histogram, vec![1, 1, 0, 1]);
         Ok(())
@@ -255,7 +248,7 @@ mod tests {
         let val_field = schema_builder.add_i64_field("val_field", FAST);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut writer = index.writer_for_tests()?;
+        let mut writer = index.writer_with_num_threads(1, 4_000_000)?;
         writer.add_document(doc!(val_field=>12i64))?;
         writer.commit()?;
         writer.add_document(doc!(val_field=>-30i64))?;
@@ -267,8 +260,7 @@ mod tests {
         let reader = index.reader()?;
         let searcher = reader.searcher();
         let all_query = AllQuery;
-        let histogram_collector =
-            HistogramCollector::new("val_field".to_string(), -20i64, 10u64, 4);
+        let histogram_collector = HistogramCollector::new(val_field, -20i64, 10u64, 4);
         let histogram = searcher.search(&all_query, &histogram_collector)?;
         assert_eq!(histogram, vec![1, 1, 0, 1]);
         Ok(())
@@ -280,22 +272,18 @@ mod tests {
         let date_field = schema_builder.add_date_field("date_field", FAST);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut writer = index.writer_for_tests()?;
-        writer.add_document(doc!(date_field=>DateTime::from_primitive(Date::from_calendar_date(1982, Month::September, 17)?.with_hms(0, 0, 0)?)))?;
-        writer.add_document(
-            doc!(date_field=>DateTime::from_primitive(Date::from_calendar_date(1986, Month::March, 9)?.with_hms(0, 0, 0)?)),
-        )?;
-        writer.add_document(doc!(date_field=>DateTime::from_primitive(Date::from_calendar_date(1983, Month::September, 27)?.with_hms(0, 0, 0)?)))?;
+        let mut writer = index.writer_with_num_threads(1, 4_000_000)?;
+        writer.add_document(doc!(date_field=>Utc.ymd(1982, 9, 17).and_hms(0, 0,0)))?;
+        writer.add_document(doc!(date_field=>Utc.ymd(1986, 3, 9).and_hms(0, 0, 0)))?;
+        writer.add_document(doc!(date_field=>Utc.ymd(1983, 9, 27).and_hms(0, 0, 0)))?;
         writer.commit()?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
         let all_query = AllQuery;
         let week_histogram_collector = HistogramCollector::new(
-            "date_field".to_string(),
-            DateTime::from_primitive(
-                Date::from_calendar_date(1980, Month::January, 1)?.with_hms(0, 0, 0)?,
-            ),
-            3_600_000_000_000 * 24 * 365, // it is just for a unit test... sorry leap years.
+            date_field,
+            Utc.ymd(1980, 1, 1).and_hms(0, 0, 0),
+            3600 * 24 * 365, // it is just for a unit test... sorry leap years.
             10,
         );
         let week_histogram = searcher.search(&all_query, &week_histogram_collector)?;

@@ -1,34 +1,33 @@
 use super::{Token, TokenStream, Tokenizer};
+use crate::tokenizer::BoxTokenStream;
 
 /// For each value of the field, emit a single unprocessed token.
-#[derive(Clone, Default)]
-pub struct RawTokenizer {
-    token: Token,
-}
+#[derive(Clone)]
+pub struct RawTokenizer;
 
-pub struct RawTokenStream<'a> {
-    token: &'a mut Token,
+pub struct RawTokenStream {
+    token: Token,
     has_token: bool,
 }
 
 impl Tokenizer for RawTokenizer {
-    type TokenStream<'a> = RawTokenStream<'a>;
-    fn token_stream<'a>(&'a mut self, text: &str) -> RawTokenStream<'a> {
-        self.token.reset();
-        self.token.position = 0;
-        self.token.position_length = 1;
-        self.token.offset_from = 0;
-        self.token.offset_to = text.len();
-        self.token.text.clear();
-        self.token.text.push_str(text);
+    fn token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a> {
+        let token = Token {
+            offset_from: 0,
+            offset_to: text.len(),
+            position: 0,
+            text: text.to_string(),
+            position_length: 1,
+        };
         RawTokenStream {
-            token: &mut self.token,
+            token,
             has_token: true,
         }
+        .into()
     }
 }
 
-impl<'a> TokenStream for RawTokenStream<'a> {
+impl TokenStream for RawTokenStream {
     fn advance(&mut self) -> bool {
         let result = self.has_token;
         self.has_token = false;
@@ -36,11 +35,11 @@ impl<'a> TokenStream for RawTokenStream<'a> {
     }
 
     fn token(&self) -> &Token {
-        self.token
+        &self.token
     }
 
     fn token_mut(&mut self) -> &mut Token {
-        self.token
+        &mut self.token
     }
 }
 
@@ -57,7 +56,7 @@ mod tests {
     }
 
     fn token_stream_helper(text: &str) -> Vec<Token> {
-        let mut a = TextAnalyzer::from(RawTokenizer::default());
+        let a = TextAnalyzer::from(RawTokenizer);
         let mut token_stream = a.token_stream(text);
         let mut tokens: Vec<Token> = vec![];
         let mut add_token = |token: &Token| {

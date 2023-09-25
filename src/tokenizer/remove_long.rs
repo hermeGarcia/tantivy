@@ -2,9 +2,8 @@
 //! ```rust
 //! use tantivy::tokenizer::*;
 //!
-//! let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
-//!   .filter(RemoveLongFilter::limit(5))
-//!   .build();
+//! let tokenizer = TextAnalyzer::from(SimpleTokenizer)
+//!   .filter(RemoveLongFilter::limit(5));
 //!
 //! let mut stream = tokenizer.token_stream("toolong nice");
 //! // because `toolong` is more than 5 characters, it is filtered
@@ -12,7 +11,8 @@
 //! assert_eq!(stream.next().unwrap().text, "nice");
 //! assert!(stream.next().is_none());
 //! ```
-use super::{Token, TokenFilter, TokenStream, Tokenizer};
+use super::{Token, TokenFilter, TokenStream};
+use crate::tokenizer::BoxTokenStream;
 
 /// `RemoveLongFilter` removes tokens that are longer
 /// than a given number of bytes (in UTF-8 representation).
@@ -31,46 +31,27 @@ impl RemoveLongFilter {
     }
 }
 
-impl<T> RemoveLongFilterStream<T> {
+impl<'a> RemoveLongFilterStream<'a> {
     fn predicate(&self, token: &Token) -> bool {
         token.text.len() < self.token_length_limit
     }
 }
 
 impl TokenFilter for RemoveLongFilter {
-    type Tokenizer<T: Tokenizer> = RemoveLongFilterWrapper<T>;
-
-    fn transform<T: Tokenizer>(self, tokenizer: T) -> RemoveLongFilterWrapper<T> {
-        RemoveLongFilterWrapper {
-            length_limit: self.length_limit,
-            inner: tokenizer,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct RemoveLongFilterWrapper<T: Tokenizer> {
-    length_limit: usize,
-    inner: T,
-}
-
-impl<T: Tokenizer> Tokenizer for RemoveLongFilterWrapper<T> {
-    type TokenStream<'a> = RemoveLongFilterStream<T::TokenStream<'a>>;
-
-    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
-        RemoveLongFilterStream {
+    fn transform<'a>(&self, token_stream: BoxTokenStream<'a>) -> BoxTokenStream<'a> {
+        BoxTokenStream::from(RemoveLongFilterStream {
             token_length_limit: self.length_limit,
-            tail: self.inner.token_stream(text),
-        }
+            tail: token_stream,
+        })
     }
 }
 
-pub struct RemoveLongFilterStream<T> {
+pub struct RemoveLongFilterStream<'a> {
     token_length_limit: usize,
-    tail: T,
+    tail: BoxTokenStream<'a>,
 }
 
-impl<T: TokenStream> TokenStream for RemoveLongFilterStream<T> {
+impl<'a> TokenStream for RemoveLongFilterStream<'a> {
     fn advance(&mut self) -> bool {
         while self.tail.advance() {
             if self.predicate(self.tail.token()) {
@@ -103,9 +84,7 @@ mod tests {
     }
 
     fn token_stream_helper(text: &str) -> Vec<Token> {
-        let mut a = TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(RemoveLongFilter::limit(6))
-            .build();
+        let a = TextAnalyzer::from(SimpleTokenizer).filter(RemoveLongFilter::limit(6));
         let mut token_stream = a.token_stream(text);
         let mut tokens: Vec<Token> = vec![];
         let mut add_token = |token: &Token| {

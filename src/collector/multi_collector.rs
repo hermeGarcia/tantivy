@@ -5,7 +5,6 @@ use super::{Collector, SegmentCollector};
 use crate::collector::Fruit;
 use crate::{DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
-/// MultiFruit keeps Fruits from every nested Collector
 pub struct MultiFruit {
     sub_fruits: Vec<Option<Box<dyn Fruit>>>,
 }
@@ -80,17 +79,12 @@ impl<TSegmentCollector: SegmentCollector> BoxableSegmentCollector
     }
 }
 
-/// FruitHandle stores reference to the corresponding collector inside MultiCollector
 pub struct FruitHandle<TFruit: Fruit> {
     pos: usize,
     _phantom: PhantomData<TFruit>,
 }
 
 impl<TFruit: Fruit> FruitHandle<TFruit> {
-    /// Extract a typed fruit off a multifruit.
-    ///
-    /// This function involves downcasting and can panic if the multifruit was
-    /// created using faulty code.
     pub fn extract(self, fruits: &mut MultiFruit) -> TFruit {
         let boxed_fruit = fruits.sub_fruits[self.pos].take().expect("");
         *boxed_fruit
@@ -120,7 +114,7 @@ impl<TFruit: Fruit> FruitHandle<TFruit> {
 /// let title = schema_builder.add_text_field("title", TEXT);
 /// let schema = schema_builder.build();
 /// let index = Index::create_in_ram(schema);
-/// let mut index_writer = index.writer(15_000_000)?;
+/// let mut index_writer = index.writer(3_000_000)?;
 /// index_writer.add_document(doc!(title => "The Name of the Wind"))?;
 /// index_writer.add_document(doc!(title => "The Diary of Muadib"))?;
 /// index_writer.add_document(doc!(title => "A Dairy Cow"))?;

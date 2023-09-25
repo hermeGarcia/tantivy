@@ -1,28 +1,24 @@
 use std::str::CharIndices;
 
-use super::{Token, TokenStream, Tokenizer};
+use super::{BoxTokenStream, Token, TokenStream, Tokenizer};
 
 /// Tokenize the text by splitting on whitespaces.
-#[derive(Clone, Default)]
-pub struct WhitespaceTokenizer {
-    token: Token,
-}
+#[derive(Clone)]
+pub struct WhitespaceTokenizer;
 
 pub struct WhitespaceTokenStream<'a> {
     text: &'a str,
     chars: CharIndices<'a>,
-    token: &'a mut Token,
+    token: Token,
 }
 
 impl Tokenizer for WhitespaceTokenizer {
-    type TokenStream<'a> = WhitespaceTokenStream<'a>;
-    fn token_stream<'a>(&'a mut self, text: &'a str) -> WhitespaceTokenStream<'a> {
-        self.token.reset();
-        WhitespaceTokenStream {
+    fn token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a> {
+        BoxTokenStream::from(WhitespaceTokenStream {
             text,
             chars: text.char_indices(),
-            token: &mut self.token,
-        }
+            token: Token::default(),
+        })
     }
 }
 
@@ -30,7 +26,7 @@ impl<'a> WhitespaceTokenStream<'a> {
     // search for the end of the current token.
     fn search_token_end(&mut self) -> usize {
         (&mut self.chars)
-            .filter(|(_, c)| c.is_ascii_whitespace())
+            .filter(|&(_, ref c)| c.is_ascii_whitespace())
             .map(|(offset, _)| offset)
             .next()
             .unwrap_or(self.text.len())
@@ -54,11 +50,11 @@ impl<'a> TokenStream for WhitespaceTokenStream<'a> {
     }
 
     fn token(&self) -> &Token {
-        self.token
+        &self.token
     }
 
     fn token_mut(&mut self) -> &mut Token {
-        self.token
+        &mut self.token
     }
 }
 
@@ -78,7 +74,7 @@ mod tests {
     }
 
     fn token_stream_helper(text: &str) -> Vec<Token> {
-        let mut a = TextAnalyzer::from(WhitespaceTokenizer::default());
+        let a = TextAnalyzer::from(WhitespaceTokenizer);
         let mut token_stream = a.token_stream(text);
         let mut tokens: Vec<Token> = vec![];
         let mut add_token = |token: &Token| {

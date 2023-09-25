@@ -1,14 +1,16 @@
 #![doc(html_logo_url = "http://fulmicoton.com/tantivy-logo/tantivy-logo.png")]
 #![cfg_attr(all(feature = "unstable", test), feature(test))]
+#![cfg_attr(
+    feature = "cargo-clippy",
+    allow(
+        clippy::module_inception,
+        clippy::needless_range_loop,
+        clippy::bool_assert_comparison
+    )
+)]
 #![doc(test(attr(allow(unused_variables), deny(warnings))))]
 #![warn(missing_docs)]
-#![allow(
-    clippy::len_without_is_empty,
-    clippy::derive_partial_eq_without_eq,
-    clippy::module_inception,
-    clippy::needless_range_loop,
-    clippy::bool_assert_comparison
-)]
+#![allow(clippy::len_without_is_empty)]
 
 //! # `tantivy`
 //!
@@ -121,20 +123,23 @@ mod functional_test;
 
 #[macro_use]
 mod macros;
-mod future_result;
 
-// Re-exports
-pub use common::DateTime;
-pub use {columnar, query_grammar, time};
+pub use chrono;
 
 pub use crate::error::TantivyError;
-pub use crate::future_result::FutureResult;
 
 /// Tantivy result.
 ///
 /// Within tantivy, please avoid importing `Result` using `use crate::Result`
 /// and instead, refer to this as `crate::Result<T>`.
 pub type Result<T> = std::result::Result<T, TantivyError>;
+
+/// Result for an Async io operation.
+#[cfg(feature = "quickwit")]
+pub type AsyncIoResult<T> = std::result::Result<T, crate::error::AsyncIoError>;
+
+/// Tantivy DateTime
+pub type DateTime = chrono::DateTime<chrono::Utc>;
 
 mod core;
 mod indexer;
@@ -150,8 +155,6 @@ pub mod fastfield;
 pub mod fieldnorm;
 pub mod positions;
 pub mod postings;
-
-/// Module containing the different query implementations.
 pub mod query;
 pub mod schema;
 pub mod space_usage;
@@ -173,26 +176,21 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 pub use self::docset::{DocSet, TERMINATED};
-#[doc(hidden)]
-pub use crate::core::json_utils;
 pub use crate::core::{
     Executor, Index, IndexBuilder, IndexMeta, IndexSettings, IndexSortByField, InvertedIndexReader,
     Order, Searcher, SearcherGeneration, Segment, SegmentComponent, SegmentId, SegmentMeta,
-    SegmentReader, SingleSegmentIndexWriter,
+    SegmentReader,
 };
 pub use crate::directory::Directory;
+pub use crate::indexer::demuxer::*;
 pub use crate::indexer::operation::UserOperation;
 pub use crate::indexer::{merge_filtered_segments, merge_indices, IndexWriter, PreparedCommit};
 pub use crate::postings::Postings;
-#[allow(deprecated)]
-pub use crate::schema::DatePrecision;
-pub use crate::schema::{DateOptions, DateTimePrecision, Document, Term};
+pub use crate::reader::LeasedItem;
+pub use crate::schema::{Document, Term};
 
 /// Index format version.
-const INDEX_FORMAT_VERSION: u32 = 5;
-
-#[cfg(all(feature = "mmap", unix))]
-pub use memmap2::Advice;
+const INDEX_FORMAT_VERSION: u32 = 4;
 
 /// Structure version for the index.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,51 +297,20 @@ pub struct DocAddress {
     pub doc_id: DocId,
 }
 
-#[macro_export]
-/// Enable fail_point if feature is enabled.
-macro_rules! fail_point {
-    ($name:expr) => {{
-        #[cfg(feature = "failpoints")]
-        {
-            fail::eval($name, |_| {
-                panic!("Return is not supported for the fail point \"{}\"", $name);
-            });
-        }
-    }};
-    ($name:expr, $e:expr) => {{
-        #[cfg(feature = "failpoints")]
-        {
-            if let Some(res) = fail::eval($name, $e) {
-                return res;
-            }
-        }
-    }};
-    ($name:expr, $cond:expr, $e:expr) => {{
-        #[cfg(feature = "failpoints")]
-        {
-            if $cond {
-                fail::fail_point!($name, $e);
-            }
-        }
-    }};
-}
-
 #[cfg(test)]
 pub mod tests {
     use common::{BinarySerializable, FixedSize};
-    use query_grammar::{UserInputAst, UserInputLeaf, UserInputLiteral};
     use rand::distributions::{Bernoulli, Uniform};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
-    use time::OffsetDateTime;
 
     use crate::collector::tests::TEST_COLLECTOR_WITH_SCORE;
     use crate::core::SegmentReader;
     use crate::docset::{DocSet, TERMINATED};
-    use crate::merge_policy::NoMergePolicy;
+    use crate::fastfield::FastFieldReader;
     use crate::query::BooleanQuery;
     use crate::schema::*;
-    use crate::{DateTime, DocAddress, Index, Postings, ReloadPolicy};
+    use crate::{DocAddress, Index, Postings, ReloadPolicy};
 
     pub fn fixed_size_test<O: BinarySerializable + FixedSize + Default>() {
         let mut buffer = Vec::new();
@@ -730,7 +697,7 @@ pub mod tests {
     fn test_indexedfield_not_in_documents() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
-        let absent_field = schema_builder.add_text_field("absent_text", TEXT);
+        let absent_field = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer_for_tests()?;
@@ -888,95 +855,6 @@ pub mod tests {
     }
 
     #[test]
-    fn test_searcher_on_json_field_with_type_inference() {
-        // When indexing and searching a json value, we infer its type.
-        // This tests aims to check the type infereence is consistent between indexing and search.
-        // Inference order is date, i64, u64, f64, bool.
-        let mut schema_builder = Schema::builder();
-        let json_field = schema_builder.add_json_field("json", STORED | TEXT);
-        let schema = schema_builder.build();
-        let json_val: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
-            r#"{
-            "signed": 2,
-            "float": 2.0,
-            "unsigned": 10000000000000,
-            "date": "1985-04-12T23:20:50.52Z",
-            "bool": true
-        }"#,
-        )
-        .unwrap();
-        let doc = doc!(json_field=>json_val);
-        let index = Index::create_in_ram(schema);
-        let mut writer = index.writer_for_tests().unwrap();
-        writer.add_document(doc).unwrap();
-        writer.commit().unwrap();
-        let reader = index.reader().unwrap();
-        let searcher = reader.searcher();
-        let get_doc_ids = |user_input_literal: UserInputLiteral| {
-            let query_parser = crate::query::QueryParser::for_index(&index, Vec::new());
-            let query = query_parser
-                .build_query_from_user_input_ast(UserInputAst::from(UserInputLeaf::Literal(
-                    user_input_literal,
-                )))
-                .unwrap();
-            searcher
-                .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-                .map(|topdocs| topdocs.docs().to_vec())
-                .unwrap()
-        };
-        {
-            let user_input_literal = UserInputLiteral {
-                field_name: Some("json.signed".to_string()),
-                phrase: "2".to_string(),
-                delimiter: crate::query_grammar::Delimiter::None,
-                slop: 0,
-                prefix: false,
-            };
-            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
-        }
-        {
-            let user_input_literal = UserInputLiteral {
-                field_name: Some("json.float".to_string()),
-                phrase: "2.0".to_string(),
-                delimiter: crate::query_grammar::Delimiter::None,
-                slop: 0,
-                prefix: false,
-            };
-            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
-        }
-        {
-            let user_input_literal = UserInputLiteral {
-                field_name: Some("json.date".to_string()),
-                phrase: "1985-04-12T23:20:50.52Z".to_string(),
-                delimiter: crate::query_grammar::Delimiter::None,
-                slop: 0,
-                prefix: false,
-            };
-            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
-        }
-        {
-            let user_input_literal = UserInputLiteral {
-                field_name: Some("json.unsigned".to_string()),
-                phrase: "10000000000000".to_string(),
-                delimiter: crate::query_grammar::Delimiter::None,
-                slop: 0,
-                prefix: false,
-            };
-            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
-        }
-        {
-            let user_input_literal = UserInputLiteral {
-                field_name: Some("json.bool".to_string()),
-                phrase: "true".to_string(),
-                delimiter: crate::query_grammar::Delimiter::None,
-                slop: 0,
-                prefix: false,
-            };
-            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
-        }
-    }
-
-    #[test]
     fn test_doc_macro() {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
@@ -1000,8 +878,8 @@ pub mod tests {
         let fast_field_unsigned = schema_builder.add_u64_field("unsigned", FAST);
         let fast_field_signed = schema_builder.add_i64_field("signed", FAST);
         let fast_field_float = schema_builder.add_f64_field("float", FAST);
-        schema_builder.add_text_field("text", TEXT);
-        schema_builder.add_u64_field("stored_int", STORED);
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let stored_int_field = schema_builder.add_u64_field("text", STORED);
         let schema = schema_builder.build();
 
         let index = Index::create_in_ram(schema);
@@ -1016,40 +894,40 @@ pub mod tests {
         let searcher = reader.searcher();
         let segment_reader: &SegmentReader = searcher.segment_reader(0);
         {
-            let fast_field_reader_res = segment_reader.fast_fields().u64("text");
+            let fast_field_reader_res = segment_reader.fast_fields().u64(text_field);
             assert!(fast_field_reader_res.is_err());
         }
         {
-            let fast_field_reader_opt = segment_reader.fast_fields().u64("stored_int");
+            let fast_field_reader_opt = segment_reader.fast_fields().u64(stored_int_field);
             assert!(fast_field_reader_opt.is_err());
         }
         {
-            let fast_field_reader_opt = segment_reader.fast_fields().u64("signed");
+            let fast_field_reader_opt = segment_reader.fast_fields().u64(fast_field_signed);
             assert!(fast_field_reader_opt.is_err());
         }
         {
-            let fast_field_reader_opt = segment_reader.fast_fields().u64("float");
+            let fast_field_reader_opt = segment_reader.fast_fields().u64(fast_field_float);
             assert!(fast_field_reader_opt.is_err());
         }
         {
-            let fast_field_reader_opt = segment_reader.fast_fields().u64("unsigned");
+            let fast_field_reader_opt = segment_reader.fast_fields().u64(fast_field_unsigned);
             assert!(fast_field_reader_opt.is_ok());
             let fast_field_reader = fast_field_reader_opt.unwrap();
-            assert_eq!(fast_field_reader.first(0), Some(4u64))
+            assert_eq!(fast_field_reader.get(0), 4u64)
         }
 
         {
-            let fast_field_reader_res = segment_reader.fast_fields().i64("signed");
+            let fast_field_reader_res = segment_reader.fast_fields().i64(fast_field_signed);
             assert!(fast_field_reader_res.is_ok());
             let fast_field_reader = fast_field_reader_res.unwrap();
-            assert_eq!(fast_field_reader.first(0), Some(4i64))
+            assert_eq!(fast_field_reader.get(0), 4i64)
         }
 
         {
-            let fast_field_reader_res = segment_reader.fast_fields().f64("float");
+            let fast_field_reader_res = segment_reader.fast_fields().f64(fast_field_float);
             assert!(fast_field_reader_res.is_ok());
             let fast_field_reader = fast_field_reader_res.unwrap();
-            assert_eq!(fast_field_reader.first(0), Some(4f64))
+            assert_eq!(fast_field_reader.get(0), 4f64)
         }
         Ok(())
     }
@@ -1057,6 +935,8 @@ pub mod tests {
     // motivated by #729
     #[test]
     fn test_update_via_delete_insert() -> crate::Result<()> {
+        use futures::executor::block_on;
+
         use crate::collector::Count;
         use crate::indexer::NoMergePolicy;
         use crate::query::AllQuery;
@@ -1110,7 +990,8 @@ pub mod tests {
             .iter()
             .map(|reader| reader.segment_id())
             .collect();
-        index_writer.merge(&segment_ids).wait()?;
+        block_on(index_writer.merge(&segment_ids)).unwrap();
+
         index_reader.reload()?;
         let searcher = index_reader.searcher();
         assert_eq!(searcher.search(&AllQuery, &Count)?, DOC_COUNT as usize);
@@ -1125,7 +1006,6 @@ pub mod tests {
         let schema = builder.build();
         let index = Index::create_in_dir(&index_path, schema)?;
         let mut writer = index.writer(50_000_000)?;
-        writer.set_merge_policy(Box::new(NoMergePolicy));
         for _ in 0..5000 {
             writer.add_document(doc!(body => "foo"))?;
             writer.add_document(doc!(body => "boo"))?;
@@ -1137,39 +1017,9 @@ pub mod tests {
         writer.delete_term(Term::from_field_text(body, "foo"));
         writer.commit()?;
         let segment_ids = index.searchable_segment_ids()?;
-        writer.merge(&segment_ids).wait()?;
+        let _ = futures::executor::block_on(writer.merge(&segment_ids));
+
         assert!(index.validate_checksum()?.is_empty());
         Ok(())
-    }
-
-    #[test]
-    fn test_datetime() {
-        let now = OffsetDateTime::now_utc();
-
-        let dt = DateTime::from_utc(now).into_utc();
-        assert_eq!(dt.to_ordinal_date(), now.to_ordinal_date());
-        assert_eq!(dt.to_hms_micro(), now.to_hms_micro());
-        // We store nanosecond level precision.
-        assert_eq!(dt.nanosecond(), now.nanosecond());
-
-        let dt = DateTime::from_timestamp_secs(now.unix_timestamp()).into_utc();
-        assert_eq!(dt.to_ordinal_date(), now.to_ordinal_date());
-        assert_eq!(dt.to_hms(), now.to_hms());
-        // Constructed from a second precision.
-        assert_ne!(dt.to_hms_micro(), now.to_hms_micro());
-
-        let dt =
-            DateTime::from_timestamp_micros((now.unix_timestamp_nanos() / 1_000) as i64).into_utc();
-        assert_eq!(dt.to_ordinal_date(), now.to_ordinal_date());
-        assert_eq!(dt.to_hms_micro(), now.to_hms_micro());
-
-        let dt_from_ts_nanos =
-            OffsetDateTime::from_unix_timestamp_nanos(1492432621123456789).unwrap();
-        let offset_dt = DateTime::from_utc(dt_from_ts_nanos).into_utc();
-        assert_eq!(
-            dt_from_ts_nanos.to_ordinal_date(),
-            offset_dt.to_ordinal_date()
-        );
-        assert_eq!(dt_from_ts_nanos.to_hms_micro(), offset_dt.to_hms_micro());
     }
 }

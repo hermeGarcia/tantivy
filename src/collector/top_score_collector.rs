@@ -1,9 +1,6 @@
 use std::collections::BinaryHeap;
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::Arc;
-
-use columnar::ColumnValues;
 
 use super::Collector;
 use crate::collector::custom_score_top_collector::CustomScoreTopCollector;
@@ -12,18 +9,18 @@ use crate::collector::tweak_score_top_collector::TweakedScoreTopCollector;
 use crate::collector::{
     CustomScorer, CustomSegmentScorer, ScoreSegmentTweaker, ScoreTweaker, SegmentCollector,
 };
-use crate::fastfield::{FastFieldNotAvailableError, FastValue};
+use crate::fastfield::{DynamicFastFieldReader, FastFieldReader, FastValue};
 use crate::query::Weight;
-use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader, TantivyError};
+use crate::schema::Field;
+use crate::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 struct FastFieldConvertCollector<
     TCollector: Collector<Fruit = Vec<(u64, DocAddress)>>,
     TFastValue: FastValue,
 > {
     pub collector: TCollector,
-    pub field: String,
+    pub field: Field,
     pub fast_value: std::marker::PhantomData<TFastValue>,
-    order: Order,
 }
 
 impl<TCollector, TFastValue> Collector for FastFieldConvertCollector<TCollector, TFastValue>
@@ -41,8 +38,7 @@ where
         segment: &SegmentReader,
     ) -> crate::Result<Self::Child> {
         let schema = segment.schema();
-        let field = schema.get_field(&self.field)?;
-        let field_entry = schema.get_field_entry(field);
+        let field_entry = schema.get_field_entry(self.field);
         if !field_entry.is_fast() {
             return Err(TantivyError::SchemaError(format!(
                 "Field {:?} is not a fast field.",
@@ -53,8 +49,10 @@ where
         let requested_type = field_entry.field_type().value_type();
         if schema_type != requested_type {
             return Err(TantivyError::SchemaError(format!(
-                "Field {:?} is of type {schema_type:?}!={requested_type:?}",
-                field_entry.name()
+                "Field {:?} is of type {:?}!={:?}",
+                field_entry.name(),
+                schema_type,
+                requested_type
             )));
         }
         self.collector.for_segment(segment_local_id, segment)
@@ -71,13 +69,7 @@ where
         let raw_result = self.collector.merge_fruits(segment_fruits)?;
         let transformed_result = raw_result
             .into_iter()
-            .map(|(score, doc_address)| {
-                if self.order.is_desc() {
-                    (TFastValue::from_u64(score), doc_address)
-                } else {
-                    (TFastValue::from_u64(u64::MAX - score), doc_address)
-                }
-            })
+            .map(|(score, doc_address)| (TFastValue::from_u64(score), doc_address))
             .collect::<Vec<_>>();
         Ok(transformed_result)
     }
@@ -87,7 +79,7 @@ where
 /// sorted by their score.
 ///
 /// The implementation is based on a `BinaryHeap`.
-/// The theoretical complexity for collecting the top `K` out of `n` documents
+/// The theorical complexity for collecting the top `K` out of `n` documents
 /// is `O(n log K)`.
 ///
 /// This collector guarantees a stable sorting in case of a tie on the
@@ -105,7 +97,7 @@ where
 /// let schema = schema_builder.build();
 /// let index = Index::create_in_ram(schema);
 ///
-/// let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+/// let mut index_writer = index.writer_with_num_threads(1, 10_000_000)?;
 /// index_writer.add_document(doc!(title => "The Name of the Wind"))?;
 /// index_writer.add_document(doc!(title => "The Diary of Muadib"))?;
 /// index_writer.add_document(doc!(title => "A Dairy Cow"))?;
@@ -137,24 +129,17 @@ impl fmt::Debug for TopDocs {
 }
 
 struct ScorerByFastFieldReader {
-    sort_column: Arc<dyn ColumnValues<u64>>,
-    order: Order,
+    ff_reader: DynamicFastFieldReader<u64>,
 }
 
 impl CustomSegmentScorer<u64> for ScorerByFastFieldReader {
     fn score(&mut self, doc: DocId) -> u64 {
-        let value = self.sort_column.get_val(doc);
-        if self.order.is_desc() {
-            value
-        } else {
-            u64::MAX - value
-        }
+        self.ff_reader.get(doc)
     }
 }
 
 struct ScorerByField {
-    field: String,
-    order: Order,
+    field: Field,
 }
 
 impl CustomScorer<u64> for ScorerByField {
@@ -166,19 +151,10 @@ impl CustomScorer<u64> for ScorerByField {
         // mapping is monotonic, so it is sufficient to compute our top-K docs.
         //
         // The conversion will then happen only on the top-K docs.
-        let sort_column_opt = segment_reader.fast_fields().u64_lenient(&self.field)?;
-        let (sort_column, _sort_column_type) =
-            sort_column_opt.ok_or_else(|| FastFieldNotAvailableError {
-                field_name: self.field.clone(),
-            })?;
-        let mut default_value = 0u64;
-        if self.order.is_asc() {
-            default_value = u64::MAX;
-        }
-        Ok(ScorerByFastFieldReader {
-            sort_column: sort_column.first_or_default_col(default_value),
-            order: self.order.clone(),
-        })
+        let ff_reader = segment_reader
+            .fast_fields()
+            .typed_fast_field_reader(self.field)?;
+        Ok(ScorerByFastFieldReader { ff_reader })
     }
 }
 
@@ -210,7 +186,7 @@ impl TopDocs {
     /// let schema = schema_builder.build();
     /// let index = Index::create_in_ram(schema);
     ///
-    /// let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+    /// let mut index_writer = index.writer_with_num_threads(1, 10_000_000)?;
     /// index_writer.add_document(doc!(title => "The Name of the Wind"))?;
     /// index_writer.add_document(doc!(title => "The Diary of Muadib"))?;
     /// index_writer.add_document(doc!(title => "A Dairy Cow"))?;
@@ -249,10 +225,11 @@ impl TopDocs {
     ///
     /// ```rust
     /// # use tantivy::schema::{Schema, FAST, TEXT};
-    /// # use tantivy::{doc, Index, DocAddress, Order};
+    /// # use tantivy::{doc, Index, DocAddress};
     /// # use tantivy::query::{Query, QueryParser};
     /// use tantivy::Searcher;
     /// use tantivy::collector::TopDocs;
+    /// use tantivy::schema::Field;
     ///
     /// # fn main() -> tantivy::Result<()> {
     /// #   let mut schema_builder = Schema::builder();
@@ -261,7 +238,7 @@ impl TopDocs {
     /// #   let schema = schema_builder.build();
     /// #
     /// #   let index = Index::create_in_ram(schema);
-    /// #   let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+    /// #   let mut index_writer = index.writer_with_num_threads(1, 10_000_000)?;
     /// #   index_writer.add_document(doc!(title => "The Name of the Wind", rating => 92u64))?;
     /// #   index_writer.add_document(doc!(title => "The Diary of Muadib", rating => 97u64))?;
     /// #   index_writer.add_document(doc!(title => "A Dairy Cow", rating => 63u64))?;
@@ -269,7 +246,7 @@ impl TopDocs {
     /// #   index_writer.commit()?;
     /// #   let reader = index.reader()?;
     /// #   let query = QueryParser::for_index(&index, vec![title]).parse_query("diary")?;
-    /// #   let top_docs = docs_sorted_by_rating(&reader.searcher(), &query)?;
+    /// #   let top_docs = docs_sorted_by_rating(&reader.searcher(), &query, rating)?;
     /// #   assert_eq!(top_docs,
     /// #            vec![(97u64, DocAddress::new(0u32, 1)),
     /// #                 (80u64, DocAddress::new(0u32, 3))]);
@@ -279,7 +256,8 @@ impl TopDocs {
     /// /// collects the top 10 documents, order by the u64-`field`
     /// /// given in argument.
     /// fn docs_sorted_by_rating(searcher: &Searcher,
-    ///                          query: &dyn Query)
+    ///                          query: &dyn Query,
+    ///                          rating_field: Field)
     ///     -> tantivy::Result<Vec<(u64, DocAddress)>> {
     ///
     ///     // This is where we build our topdocs collector
@@ -287,7 +265,7 @@ impl TopDocs {
     ///     // Note the `rating_field` needs to be a FAST field here.
     ///     let top_books_by_rating = TopDocs
     ///                 ::with_limit(10)
-    ///                  .order_by_fast_field("rating", Order::Desc);
+    ///                  .order_by_u64_field(rating_field);
     ///
     ///     // ... and here are our documents. Note this is a simple vec.
     ///     // The `u64` in the pair is the value of our fast field for
@@ -305,20 +283,13 @@ impl TopDocs {
     ///
     /// # See also
     ///
-    /// To comfortably work with `u64`s, `i64`s, `f64`s, or `date`s, please refer to
-    /// the [.order_by_fast_field(...)](TopDocs::order_by_fast_field) method.
-    fn order_by_u64_field(
+    /// To confortably work with `u64`s, `i64`s, `f64`s, or `date`s, please refer to
+    /// [.order_by_fast_field(...)](#method.order_by_fast_field) method.
+    pub fn order_by_u64_field(
         self,
-        field: impl ToString,
-        order: Order,
+        field: Field,
     ) -> impl Collector<Fruit = Vec<(u64, DocAddress)>> {
-        CustomScoreTopCollector::new(
-            ScorerByField {
-                field: field.to_string(),
-                order,
-            },
-            self.0.into_tscore(),
-        )
+        CustomScoreTopCollector::new(ScorerByField { field }, self.0.into_tscore())
     }
 
     /// Set top-K to rank documents by a given fast field.
@@ -337,25 +308,26 @@ impl TopDocs {
     ///
     /// ```rust
     /// # use tantivy::schema::{Schema, FAST, TEXT};
-    /// # use tantivy::{doc, Index, DocAddress,Order};
+    /// # use tantivy::{doc, Index, DocAddress};
     /// # use tantivy::query::{Query, AllQuery};
     /// use tantivy::Searcher;
     /// use tantivy::collector::TopDocs;
+    /// use tantivy::schema::Field;
     ///
     /// # fn main() -> tantivy::Result<()> {
     /// #   let mut schema_builder = Schema::builder();
     /// #   let title = schema_builder.add_text_field("company", TEXT);
-    /// #   let revenue = schema_builder.add_i64_field("revenue", FAST);
+    /// #   let rating = schema_builder.add_i64_field("revenue", FAST);
     /// #   let schema = schema_builder.build();
     /// #
     /// #   let index = Index::create_in_ram(schema);
-    /// #   let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
-    /// #   index_writer.add_document(doc!(title => "MadCow Inc.", revenue => 92_000_000i64))?;
-    /// #   index_writer.add_document(doc!(title => "Zozo Cow KKK", revenue => 119_000_000i64))?;
-    /// #   index_writer.add_document(doc!(title => "Declining Cow", revenue => -63_000_000i64))?;
+    /// #   let mut index_writer = index.writer_with_num_threads(1, 10_000_000)?;
+    /// #   index_writer.add_document(doc!(title => "MadCow Inc.", rating => 92_000_000i64))?;
+    /// #   index_writer.add_document(doc!(title => "Zozo Cow KKK", rating => 119_000_000i64))?;
+    /// #   index_writer.add_document(doc!(title => "Declining Cow", rating => -63_000_000i64))?;
     /// #   assert!(index_writer.commit().is_ok());
     /// #   let reader = index.reader()?;
-    /// #   let top_docs = docs_sorted_by_revenue(&reader.searcher(), &AllQuery, "revenue")?;
+    /// #   let top_docs = docs_sorted_by_revenue(&reader.searcher(), &AllQuery, rating)?;
     /// #   assert_eq!(top_docs,
     /// #            vec![(119_000_000i64, DocAddress::new(0, 1)),
     /// #                 (92_000_000i64, DocAddress::new(0, 0))]);
@@ -366,7 +338,7 @@ impl TopDocs {
     /// /// given in argument.
     /// fn docs_sorted_by_revenue(searcher: &Searcher,
     ///                          query: &dyn Query,
-    ///                          revenue_field: &str)
+    ///                          revenue_field: Field)
     ///     -> tantivy::Result<Vec<(i64, DocAddress)>> {
     ///
     ///     // This is where we build our topdocs collector
@@ -375,7 +347,7 @@ impl TopDocs {
     ///     // type `sort_by_field`. revenue_field here is a FAST i64 field.
     ///     let top_company_by_revenue = TopDocs
     ///                 ::with_limit(2)
-    ///                  .order_by_fast_field("revenue", Order::Desc);
+    ///                  .order_by_fast_field(revenue_field);
     ///
     ///     // ... and here are our documents. Note this is a simple vec.
     ///     // The `i64` in the pair is the value of our fast field for
@@ -392,18 +364,16 @@ impl TopDocs {
     /// ```
     pub fn order_by_fast_field<TFastValue>(
         self,
-        fast_field: impl ToString,
-        order: Order,
+        fast_field: Field,
     ) -> impl Collector<Fruit = Vec<(TFastValue, DocAddress)>>
     where
         TFastValue: FastValue,
     {
-        let u64_collector = self.order_by_u64_field(fast_field.to_string(), order.clone());
+        let u64_collector = self.order_by_u64_field(fast_field);
         FastFieldConvertCollector {
             collector: u64_collector,
-            field: fast_field.to_string(),
+            field: fast_field,
             fast_value: PhantomData,
-            order,
         }
     }
 
@@ -411,7 +381,7 @@ impl TopDocs {
     ///
     /// This method offers a convenient way to tweak or replace
     /// the documents score. As suggested by the prototype you can
-    /// manually define your own [`ScoreTweaker`]
+    /// manually define your own [`ScoreTweaker`](./trait.ScoreTweaker.html)
     /// and pass it as an argument, but there is a much simpler way to
     /// tweak your score: you can use a closure as in the following
     /// example.
@@ -428,7 +398,7 @@ impl TopDocs {
     /// In the following example will will tweak our ranking a bit by
     /// boosting popular products a notch.
     ///
-    /// In more serious application, this tweaking could involve running a
+    /// In more serious application, this tweaking could involved running a
     /// learning-to-rank model over various features
     ///
     /// ```rust
@@ -437,6 +407,7 @@ impl TopDocs {
     /// # use tantivy::query::QueryParser;
     /// use tantivy::SegmentReader;
     /// use tantivy::collector::TopDocs;
+    /// use tantivy::fastfield::FastFieldReader;
     /// use tantivy::schema::Field;
     ///
     /// fn create_schema() -> Schema {
@@ -449,7 +420,7 @@ impl TopDocs {
     /// fn create_index() -> tantivy::Result<Index> {
     ///   let schema = create_schema();
     ///   let index = Index::create_in_ram(schema);
-    ///   let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+    ///   let mut index_writer = index.writer_with_num_threads(1, 10_000_000)?;
     ///   let product_name = index.schema().get_field("product_name").unwrap();
     ///   let popularity: Field = index.schema().get_field("popularity").unwrap();
     ///   index_writer.add_document(doc!(product_name => "The Diary of Muadib", popularity => 1u64))?;
@@ -479,14 +450,13 @@ impl TopDocs {
     ///             // Typically, fast_fields.
     ///             //
     ///             // In our case, we will get a reader for the popularity
-    ///             // fast field. For simplicity we read the first or default value in the fast
-    ///             // field.
+    ///             // fast field.
     ///             let popularity_reader =
-    ///                 segment_reader.fast_fields().u64("popularity").unwrap().first_or_default_col(0);
+    ///                 segment_reader.fast_fields().u64(popularity).unwrap();
     ///
     ///             // We can now define our actual scoring function
     ///             move |doc: DocId, original_score: Score| {
-    ///                 let popularity: u64 = popularity_reader.get_val(doc);
+    ///                 let popularity: u64 = popularity_reader.get(doc);
     ///                 // Well.. For the sake of the example we use a simple logarithm
     ///                 // function.
     ///                 let popularity_boost_score = ((2u64 + popularity) as Score).log2();
@@ -502,7 +472,7 @@ impl TopDocs {
     /// ```
     ///
     /// # See also
-    /// - [custom_score(...)](TopDocs::custom_score)
+    /// [custom_score(...)](#method.custom_score).
     pub fn tweak_score<TScore, TScoreSegmentTweaker, TScoreTweaker>(
         self,
         score_tweaker: TScoreTweaker,
@@ -519,7 +489,8 @@ impl TopDocs {
     ///
     /// This method offers a convenient way to use a different score.
     ///
-    /// As suggested by the prototype you can manually define your own [`CustomScorer`]
+    /// As suggested by the prototype you can manually define your
+    /// own [`CustomScorer`](./trait.CustomScorer.html)
     /// and pass it as an argument, but there is a much simpler way to
     /// tweak your score: you can use a closure as in the following
     /// example.
@@ -528,7 +499,7 @@ impl TopDocs {
     ///
     /// This method only makes it possible to compute the score from a given
     /// `DocId`, fastfield values for the doc and any information you could
-    /// have precomputed beforehand. It does not make it possible for instance
+    /// have precomputed beforehands. It does not make it possible for instance
     /// to compute something like TfIdf as it does not have access to the list of query
     /// terms present in the document, nor the term frequencies for the different terms.
     ///
@@ -544,6 +515,7 @@ impl TopDocs {
     /// use tantivy::SegmentReader;
     /// use tantivy::collector::TopDocs;
     /// use tantivy::schema::Field;
+    /// use tantivy::fastfield::FastFieldReader;
     ///
     /// # fn create_schema() -> Schema {
     /// #    let mut schema_builder = Schema::builder();
@@ -556,7 +528,7 @@ impl TopDocs {
     /// # fn main() -> tantivy::Result<()> {
     /// #   let schema = create_schema();
     /// #   let index = Index::create_in_ram(schema);
-    /// #   let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+    /// #   let mut index_writer = index.writer_with_num_threads(1, 10_000_000)?;
     /// #   let product_name = index.schema().get_field("product_name").unwrap();
     /// #
     /// let popularity: Field = index.schema().get_field("popularity").unwrap();
@@ -589,14 +561,14 @@ impl TopDocs {
     ///             // Note that this is implemented by using a `(u64, u64)`
     ///             // as a score.
     ///             let popularity_reader =
-    ///                 segment_reader.fast_fields().u64("popularity").unwrap().first_or_default_col(0);
+    ///                 segment_reader.fast_fields().u64(popularity).unwrap();
     ///             let boosted_reader =
-    ///                 segment_reader.fast_fields().u64("boosted").unwrap().first_or_default_col(0);
+    ///                 segment_reader.fast_fields().u64(boosted).unwrap();
     ///
     ///             // We can now define our actual scoring function
     ///             move |doc: DocId| {
-    ///                 let popularity: u64 = popularity_reader.get_val(doc);
-    ///                 let boosted: u64 = boosted_reader.get_val(doc);
+    ///                 let popularity: u64 = popularity_reader.get(doc);
+    ///                 let boosted: u64 = boosted_reader.get(doc);
     ///                 // Score do not have to be `f64` in tantivy.
     ///                 // Here we return a couple to get lexicographical order
     ///                 // for free.
@@ -615,7 +587,7 @@ impl TopDocs {
     /// ```
     ///
     /// # See also
-    /// - [tweak_score(...)](TopDocs::tweak_score)
+    /// [tweak_score(...)](#method.tweak_score).
     pub fn custom_score<TScore, TCustomSegmentScorer, TCustomScorer>(
         self,
         custom_score: TCustomScorer,
@@ -721,7 +693,7 @@ impl Collector for TopDocs {
     }
 }
 
-/// Segment Collector associated with `TopDocs`.
+/// Segment Collector associated to `TopDocs`.
 pub struct TopScoreSegmentCollector(TopSegmentCollector<Score>);
 
 impl SegmentCollector for TopScoreSegmentCollector {
@@ -742,9 +714,7 @@ mod tests {
     use crate::collector::Collector;
     use crate::query::{AllQuery, Query, QueryParser};
     use crate::schema::{Field, Schema, FAST, STORED, TEXT};
-    use crate::time::format_description::well_known::Rfc3339;
-    use crate::time::OffsetDateTime;
-    use crate::{DateTime, DocAddress, DocId, Index, IndexWriter, Order, Score, SegmentReader};
+    use crate::{DocAddress, DocId, Index, IndexWriter, Score, SegmentReader};
 
     fn make_index() -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
@@ -752,7 +722,7 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         // writing the segment
-        let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+        let mut index_writer = index.writer_with_num_threads(1, 10_000_000)?;
         index_writer.add_document(doc!(text_field=>"Hello happy tax payer."))?;
         index_writer.add_document(doc!(text_field=>"Droopy says hello happy tax payer"))?;
         index_writer.add_document(doc!(text_field=>"I like Droopy"))?;
@@ -905,7 +875,7 @@ mod tests {
         });
         let searcher = index.reader()?.searcher();
 
-        let top_collector = TopDocs::with_limit(4).order_by_u64_field(SIZE, Order::Desc);
+        let top_collector = TopDocs::with_limit(4).order_by_u64_field(size);
         let top_docs: Vec<(u64, DocAddress)> = searcher.search(&query, &top_collector)?;
         assert_eq!(
             &top_docs[..],
@@ -920,32 +890,28 @@ mod tests {
 
     #[test]
     fn test_top_field_collector_datetime() -> crate::Result<()> {
+        use std::str::FromStr;
         let mut schema_builder = Schema::builder();
         let name = schema_builder.add_text_field("name", TEXT);
         let birthday = schema_builder.add_date_field("birthday", FAST);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer_for_tests()?;
-        let pr_birthday = DateTime::from_utc(OffsetDateTime::parse(
-            "1898-04-09T00:00:00+00:00",
-            &Rfc3339,
-        )?);
+        let pr_birthday = crate::DateTime::from_str("1898-04-09T00:00:00+00:00")?;
         index_writer.add_document(doc!(
             name => "Paul Robeson",
-            birthday => pr_birthday,
+            birthday => pr_birthday
         ))?;
-        let mr_birthday = DateTime::from_utc(OffsetDateTime::parse(
-            "1947-11-08T00:00:00+00:00",
-            &Rfc3339,
-        )?);
+        let mr_birthday = crate::DateTime::from_str("1947-11-08T00:00:00+00:00")?;
         index_writer.add_document(doc!(
             name => "Minnie Riperton",
-            birthday => mr_birthday,
+            birthday => mr_birthday
         ))?;
         index_writer.commit()?;
         let searcher = index.reader()?.searcher();
-        let top_collector = TopDocs::with_limit(3).order_by_fast_field("birthday", Order::Desc);
-        let top_docs: Vec<(DateTime, DocAddress)> = searcher.search(&AllQuery, &top_collector)?;
+        let top_collector = TopDocs::with_limit(3).order_by_fast_field(birthday);
+        let top_docs: Vec<(crate::DateTime, DocAddress)> =
+            searcher.search(&AllQuery, &top_collector)?;
         assert_eq!(
             &top_docs[..],
             &[
@@ -974,7 +940,7 @@ mod tests {
         ))?;
         index_writer.commit()?;
         let searcher = index.reader()?.searcher();
-        let top_collector = TopDocs::with_limit(3).order_by_fast_field("altitude", Order::Desc);
+        let top_collector = TopDocs::with_limit(3).order_by_fast_field(altitude);
         let top_docs: Vec<(i64, DocAddress)> = searcher.search(&AllQuery, &top_collector)?;
         assert_eq!(
             &top_docs[..],
@@ -1004,7 +970,7 @@ mod tests {
         ))?;
         index_writer.commit()?;
         let searcher = index.reader()?.searcher();
-        let top_collector = TopDocs::with_limit(3).order_by_fast_field("altitude", Order::Desc);
+        let top_collector = TopDocs::with_limit(3).order_by_fast_field(altitude);
         let top_docs: Vec<(f64, DocAddress)> = searcher.search(&AllQuery, &top_collector)?;
         assert_eq!(
             &top_docs[..],
@@ -1032,7 +998,7 @@ mod tests {
                 .unwrap();
         });
         let searcher = index.reader().unwrap().searcher();
-        let top_collector = TopDocs::with_limit(4).order_by_u64_field("missing_field", Order::Desc);
+        let top_collector = TopDocs::with_limit(4).order_by_u64_field(Field::from_field_id(2));
         let segment_reader = searcher.segment_reader(0u32);
         top_collector
             .for_segment(0, segment_reader)
@@ -1050,9 +1016,9 @@ mod tests {
         index_writer.commit()?;
         let searcher = index.reader()?.searcher();
         let segment = searcher.segment_reader(0);
-        let top_collector = TopDocs::with_limit(4).order_by_u64_field(SIZE, Order::Desc);
+        let top_collector = TopDocs::with_limit(4).order_by_u64_field(size);
         let err = top_collector.for_segment(0, segment).err().unwrap();
-        assert!(matches!(err, crate::TantivyError::InvalidArgument(_)));
+        assert!(matches!(err, crate::TantivyError::SchemaError(_)));
         Ok(())
     }
 
@@ -1067,7 +1033,7 @@ mod tests {
         index_writer.commit()?;
         let searcher = index.reader()?.searcher();
         let segment = searcher.segment_reader(0);
-        let top_collector = TopDocs::with_limit(4).order_by_fast_field::<i64>(SIZE, Order::Desc);
+        let top_collector = TopDocs::with_limit(4).order_by_fast_field::<i64>(size);
         let err = top_collector.for_segment(0, segment).err().unwrap();
         assert!(
             matches!(err, crate::TantivyError::SchemaError(msg) if msg == "Field \"size\" is not a fast field.")
@@ -1122,57 +1088,11 @@ mod tests {
         mut doc_adder: impl FnMut(&mut IndexWriter),
     ) -> (Index, Box<dyn Query>) {
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        let mut index_writer = index.writer_with_num_threads(1, 10_000_000).unwrap();
         doc_adder(&mut index_writer);
         index_writer.commit().unwrap();
         let query_parser = QueryParser::for_index(&index, vec![query_field]);
         let query = query_parser.parse_query(query).unwrap();
         (index, query)
-    }
-    #[test]
-    fn test_fast_field_ascending_order() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let title = schema_builder.add_text_field(TITLE, TEXT);
-        let size = schema_builder.add_u64_field(SIZE, FAST);
-        let schema = schema_builder.build();
-        let (index, query) = index("beer", title, schema, |index_writer| {
-            index_writer
-                .add_document(doc!(
-                    title => "bottle of beer",
-                    size => 12u64,
-                ))
-                .unwrap();
-            index_writer
-                .add_document(doc!(
-                    title => "growler of beer",
-                    size => 64u64,
-                ))
-                .unwrap();
-            index_writer
-                .add_document(doc!(
-                    title => "pint of beer",
-                    size => 16u64,
-                ))
-                .unwrap();
-            index_writer
-                .add_document(doc!(
-                    title => "empty beer",
-                ))
-                .unwrap();
-        });
-        let searcher = index.reader()?.searcher();
-
-        let top_collector = TopDocs::with_limit(4).order_by_fast_field(SIZE, Order::Asc);
-        let top_docs: Vec<(u64, DocAddress)> = searcher.search(&query, &top_collector)?;
-        assert_eq!(
-            &top_docs[..],
-            &[
-                (12, DocAddress::new(0, 0)),
-                (16, DocAddress::new(0, 2)),
-                (64, DocAddress::new(0, 1)),
-                (18446744073709551615, DocAddress::new(0, 3)),
-            ]
-        );
-        Ok(())
     }
 }

@@ -9,7 +9,7 @@ use crc32fast::Hasher;
 
 use crate::directory::{WatchCallback, WatchCallbackList, WatchHandle};
 
-const POLLING_INTERVAL: Duration = Duration::from_millis(if cfg!(test) { 1 } else { 500 });
+pub const POLLING_INTERVAL: Duration = Duration::from_millis(if cfg!(test) { 1 } else { 500 });
 
 // Watches a file and executes registered callbacks when the file is modified.
 pub struct FileWatcher {
@@ -53,9 +53,7 @@ impl FileWatcher {
                         if metafile_has_changed {
                             info!("Meta file {:?} was modified", path);
                             current_checksum_opt = Some(checksum);
-                            // We actually ignore callbacks failing here.
-                            // We just wait for the end of their execution.
-                            let _ = callbacks.broadcast().wait();
+                            futures::executor::block_on(callbacks.broadcast());
                         }
                     }
 
@@ -110,7 +108,7 @@ mod tests {
         let tmp_file = tmp_dir.path().join("watched.txt");
 
         let counter: Arc<AtomicUsize> = Default::default();
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crossbeam::channel::unbounded();
         let timeout = Duration::from_millis(100);
 
         let watcher = FileWatcher::new(&tmp_file);
@@ -153,7 +151,7 @@ mod tests {
         let tmp_file = tmp_dir.path().join("watched.txt");
 
         let counter: Arc<AtomicUsize> = Default::default();
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crossbeam::channel::unbounded();
         let timeout = Duration::from_millis(100);
 
         let watcher = FileWatcher::new(&tmp_file);

@@ -8,21 +8,12 @@ use crate::Score;
 #[derive(Clone)]
 pub enum LogicalLiteral {
     Term(Term),
-    Phrase {
-        terms: Vec<(usize, Term)>,
-        slop: u32,
-        prefix: bool,
-    },
+    Phrase(Vec<(usize, Term)>),
     Range {
-        field: String,
+        field: Field,
         value_type: Type,
         lower: Bound<Term>,
         upper: Bound<Term>,
-    },
-    Set {
-        field: Field,
-        value_type: Type,
-        elements: Vec<Term>,
     },
     All,
 }
@@ -58,17 +49,17 @@ impl fmt::Debug for LogicalAst {
                 if clause.is_empty() {
                     write!(formatter, "<emptyclause>")?;
                 } else {
-                    let (occur, subquery) = &clause[0];
-                    write!(formatter, "({}{subquery:?}", occur_letter(*occur))?;
-                    for (occur, subquery) in &clause[1..] {
-                        write!(formatter, " {}{subquery:?}", occur_letter(*occur))?;
+                    let (ref occur, ref subquery) = clause[0];
+                    write!(formatter, "({}{:?}", occur_letter(*occur), subquery)?;
+                    for &(ref occur, ref subquery) in &clause[1..] {
+                        write!(formatter, " {}{:?}", occur_letter(*occur), subquery)?;
                     }
                     formatter.write_str(")")?;
                 }
                 Ok(())
             }
-            LogicalAst::Boost(ref ast, boost) => write!(formatter, "{ast:?}^{boost}"),
-            LogicalAst::Leaf(ref literal) => write!(formatter, "{literal:?}"),
+            LogicalAst::Boost(ref ast, boost) => write!(formatter, "{:?}^{}", ast, boost),
+            LogicalAst::Leaf(ref literal) => write!(formatter, "{:?}", literal),
         }
     }
 }
@@ -82,46 +73,13 @@ impl From<LogicalLiteral> for LogicalAst {
 impl fmt::Debug for LogicalLiteral {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match *self {
-            LogicalLiteral::Term(ref term) => write!(formatter, "{term:?}"),
-            LogicalLiteral::Phrase {
-                ref terms,
-                slop,
-                prefix,
-            } => {
-                write!(formatter, "\"{terms:?}\"")?;
-                if slop > 0 {
-                    write!(formatter, "~{slop:?}")
-                } else if prefix {
-                    write!(formatter, "*")
-                } else {
-                    Ok(())
-                }
-            }
+            LogicalLiteral::Term(ref term) => write!(formatter, "{:?}", term),
+            LogicalLiteral::Phrase(ref terms) => write!(formatter, "\"{:?}\"", terms),
             LogicalLiteral::Range {
                 ref lower,
                 ref upper,
                 ..
-            } => write!(formatter, "({lower:?} TO {upper:?})"),
-            LogicalLiteral::Set { ref elements, .. } => {
-                const MAX_DISPLAYED: usize = 10;
-
-                write!(formatter, "IN [")?;
-                for (i, element) in elements.iter().enumerate() {
-                    if i == 0 {
-                        write!(formatter, "{element:?}")?;
-                    } else if i == MAX_DISPLAYED - 1 {
-                        write!(
-                            formatter,
-                            ", {element:?}, ... ({} more)",
-                            elements.len() - i - 1
-                        )?;
-                        break;
-                    } else {
-                        write!(formatter, ", {element:?}")?;
-                    }
-                }
-                write!(formatter, "]")
-            }
+            } => write!(formatter, "({:?} TO {:?})", lower, upper),
             LogicalLiteral::All => write!(formatter, "*"),
         }
     }

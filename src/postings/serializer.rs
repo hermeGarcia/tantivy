@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::io::{self, Write};
 
 use common::{BinarySerializable, CountingWriter, VInt};
+use fail::fail_point;
 
 use super::TermInfo;
 use crate::core::Segment;
@@ -12,7 +13,7 @@ use crate::postings::compression::{BlockEncoder, VIntEncoder, COMPRESSION_BLOCK_
 use crate::postings::skip::SkipSerializer;
 use crate::query::Bm25Weight;
 use crate::schema::{Field, FieldEntry, FieldType, IndexRecordOption, Schema};
-use crate::termdict::TermDictionaryBuilder;
+use crate::termdict::{TermDictionaryBuilder, TermOrdinal};
 use crate::{DocId, Score};
 
 /// `InvertedIndexSerializer` is in charge of serializing
@@ -42,7 +43,7 @@ use crate::{DocId, Score};
 /// * `close()`
 ///
 /// Terms have to be pushed in a lexicographically-sorted order.
-/// Within a term, documents have to be pushed in increasing order.
+/// Within a term, document have to be pushed in increasing order.
 ///
 /// A description of the serialization format is
 /// [available here](https://fulmicoton.gitbooks.io/tantivy-doc/content/inverted-index.html).
@@ -54,7 +55,7 @@ pub struct InvertedIndexSerializer {
 }
 
 impl InvertedIndexSerializer {
-    /// Open a new `InvertedIndexSerializer` for the given segment
+    /// Open a new `PostingsSerializer` for the given segment
     pub fn open(segment: &mut Segment) -> crate::Result<InvertedIndexSerializer> {
         use crate::SegmentComponent::{Positions, Postings, Terms};
         let inv_index_serializer = InvertedIndexSerializer {
@@ -108,6 +109,7 @@ pub struct FieldSerializer<'a> {
     positions_serializer_opt: Option<PositionSerializer<&'a mut CountingWriter<WritePtr>>>,
     current_term_info: TermInfo,
     term_open: bool,
+    num_terms: TermOrdinal,
 }
 
 impl<'a> FieldSerializer<'a> {
@@ -146,6 +148,7 @@ impl<'a> FieldSerializer<'a> {
             positions_serializer_opt,
             current_term_info: TermInfo::default(),
             term_open: false,
+            num_terms: TermOrdinal::default(),
         })
     }
 
@@ -168,20 +171,23 @@ impl<'a> FieldSerializer<'a> {
     /// * term - the term. It needs to come after the previous term according to the lexicographical
     ///   order.
     /// * term_doc_freq - return the number of document containing the term.
-    pub fn new_term(&mut self, term: &[u8], term_doc_freq: u32) -> io::Result<()> {
+    pub fn new_term(&mut self, term: &[u8], term_doc_freq: u32) -> io::Result<TermOrdinal> {
         assert!(
             !self.term_open,
             "Called new_term, while the previous term was not closed."
         );
+
         self.term_open = true;
         self.postings_serializer.clear();
         self.current_term_info = self.current_term_info();
         self.term_dictionary_builder.insert_key(term)?;
+        let term_ordinal = self.num_terms;
+        self.num_terms += 1;
         self.postings_serializer.new_term(term_doc_freq);
-        Ok(())
+        Ok(term_ordinal)
     }
 
-    /// Serialize the information that a document contains for the current term:
+    /// Serialize the information that a document contains the current term,
     /// its term frequency, and the position deltas.
     ///
     /// At this point, the positions are already `delta-encoded`.
@@ -201,11 +207,11 @@ impl<'a> FieldSerializer<'a> {
 
     /// Finish the serialization for this term postings.
     ///
-    /// If the current block is incomplete, it needs to be encoded
+    /// If the current block is incomplete, it need to be encoded
     /// using `VInt` encoding.
     pub fn close_term(&mut self) -> io::Result<()> {
-        crate::fail_point!("FieldSerializer::close_term", |msg: Option<String>| {
-            Err(io::Error::new(io::ErrorKind::Other, format!("{msg:?}")))
+        fail_point!("FieldSerializer::close_term", |msg: Option<String>| {
+            Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", msg)))
         });
         if self.term_open {
             self.postings_serializer
@@ -225,7 +231,7 @@ impl<'a> FieldSerializer<'a> {
         Ok(())
     }
 
-    /// Closes the current field.
+    /// Closes the current current field.
     pub fn close(mut self) -> io::Result<()> {
         self.close_term()?;
         if let Some(positions_serializer) = self.positions_serializer_opt {
@@ -459,7 +465,7 @@ impl<W: Write> PostingsSerializer<W> {
     /// When called after writing the postings of a term, this value is used as a
     /// end offset.
     fn written_bytes(&self) -> u64 {
-        self.output_write.written_bytes()
+        self.output_write.written_bytes() as u64
     }
 
     fn clear(&mut self) {

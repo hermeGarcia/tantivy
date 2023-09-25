@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::{DocId, Score, TantivyError};
 
 pub(crate) fn does_not_match(doc: DocId) -> TantivyError {
-    TantivyError::InvalidArgument(format!("Document #({doc}) does not match"))
+    TantivyError::InvalidArgument(format!("Document #({}) does not match", doc))
 }
 
 /// Object describing the score of a given document.
@@ -39,7 +39,7 @@ impl Explanation {
         }
     }
 
-    /// Returns the value associated with the current node.
+    /// Returns the value associated to the current node.
     pub fn value(&self) -> Score {
         self.value
     }

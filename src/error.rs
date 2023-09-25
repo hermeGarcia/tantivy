@@ -1,12 +1,11 @@
 //! Definition of Tantivy's errors and results.
 
 use std::path::PathBuf;
-use std::sync::{Arc, PoisonError};
+use std::sync::PoisonError;
 use std::{fmt, io};
 
 use thiserror::Error;
 
-use crate::aggregation::AggregationError;
 use crate::directory::error::{
     Incompatibility, LockError, OpenDirectoryError, OpenReadError, OpenWriteError,
 };
@@ -16,7 +15,6 @@ use crate::{query, schema};
 /// Represents a `DataCorruption` error.
 ///
 /// When facing data corruption, tantivy actually panics or returns this error.
-#[derive(Clone)]
 pub struct DataCorruption {
     filepath: Option<PathBuf>,
     comment: String,
@@ -44,7 +42,7 @@ impl fmt::Debug for DataCorruption {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(f, "Data corruption")?;
         if let Some(ref filepath) = &self.filepath {
-            write!(f, " (in file `{filepath:?}`)")?;
+            write!(f, " (in file `{:?}`)", filepath)?;
         }
         write!(f, ": {}.", self.comment)?;
         Ok(())
@@ -52,11 +50,8 @@ impl fmt::Debug for DataCorruption {
 }
 
 /// The library's error enum
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Error)]
 pub enum TantivyError {
-    /// Error when handling aggregations.
-    #[error(transparent)]
-    AggregationError(#[from] AggregationError),
     /// Failed to open the directory.
     #[error("Failed to open the directory: '{0:?}'")]
     OpenDirectoryError(#[from] OpenDirectoryError),
@@ -74,7 +69,7 @@ pub enum TantivyError {
     LockFailure(LockError, Option<String>),
     /// IO Error.
     #[error("An IO error occurred: '{0}'")]
-    IoError(Arc<io::Error>),
+    IoError(#[from] io::Error),
     /// Data corruption.
     #[error("Data corrupted: '{0:?}'")]
     DataCorruption(DataCorruption),
@@ -102,17 +97,30 @@ pub enum TantivyError {
     /// Index incompatible with current version of Tantivy.
     #[error("{0:?}")]
     IncompatibleIndex(Incompatibility),
-    /// An internal error occurred. This is are internal states that should not be reached.
-    /// e.g. a datastructure is incorrectly inititalized.
-    #[error("Internal error: '{0}'")]
-    InternalError(String),
 }
 
-impl From<io::Error> for TantivyError {
-    fn from(io_err: io::Error) -> TantivyError {
-        TantivyError::IoError(Arc::new(io_err))
+#[cfg(feature = "quickwit")]
+#[derive(Error, Debug)]
+#[doc(hidden)]
+pub enum AsyncIoError {
+    #[error("io::Error `{0}`")]
+    Io(#[from] io::Error),
+    #[error("Asynchronous API is unsupported by this directory")]
+    AsyncUnsupported,
+}
+
+#[cfg(feature = "quickwit")]
+impl From<AsyncIoError> for TantivyError {
+    fn from(async_io_err: AsyncIoError) -> Self {
+        match async_io_err {
+            AsyncIoError::Io(io_err) => TantivyError::from(io_err),
+            AsyncIoError::AsyncUnsupported => {
+                TantivyError::SystemError(format!("{:?}", async_io_err))
+            }
+        }
     }
 }
+
 impl From<DataCorruption> for TantivyError {
     fn from(data_corruption: DataCorruption) -> TantivyError {
         TantivyError::DataCorruption(data_corruption)
@@ -120,7 +128,7 @@ impl From<DataCorruption> for TantivyError {
 }
 impl From<FastFieldNotAvailableError> for TantivyError {
     fn from(fastfield_error: FastFieldNotAvailableError) -> TantivyError {
-        TantivyError::SchemaError(format!("{fastfield_error}"))
+        TantivyError::SchemaError(format!("{}", fastfield_error))
     }
 }
 impl From<LockError> for TantivyError {
@@ -131,7 +139,7 @@ impl From<LockError> for TantivyError {
 
 impl From<query::QueryParserError> for TantivyError {
     fn from(parsing_error: query::QueryParserError) -> TantivyError {
-        TantivyError::InvalidArgument(format!("Query is invalid. {parsing_error:?}"))
+        TantivyError::InvalidArgument(format!("Query is invalid. {:?}", parsing_error))
     }
 }
 
@@ -141,33 +149,21 @@ impl<Guard> From<PoisonError<Guard>> for TantivyError {
     }
 }
 
-impl From<time::error::Format> for TantivyError {
-    fn from(err: time::error::Format) -> TantivyError {
-        TantivyError::InvalidArgument(format!("Date formatting error: {err}"))
-    }
-}
-
-impl From<time::error::Parse> for TantivyError {
-    fn from(err: time::error::Parse) -> TantivyError {
-        TantivyError::InvalidArgument(format!("Date parsing error: {err}"))
-    }
-}
-
-impl From<time::error::ComponentRange> for TantivyError {
-    fn from(err: time::error::ComponentRange) -> TantivyError {
-        TantivyError::InvalidArgument(format!("Date range error: {err}"))
+impl From<chrono::ParseError> for TantivyError {
+    fn from(err: chrono::ParseError) -> TantivyError {
+        TantivyError::InvalidArgument(err.to_string())
     }
 }
 
 impl From<schema::DocParsingError> for TantivyError {
     fn from(error: schema::DocParsingError) -> TantivyError {
-        TantivyError::InvalidArgument(format!("Failed to parse document {error:?}"))
+        TantivyError::InvalidArgument(format!("Failed to parse document {:?}", error))
     }
 }
 
 impl From<serde_json::Error> for TantivyError {
     fn from(error: serde_json::Error) -> TantivyError {
-        TantivyError::IoError(Arc::new(error.into()))
+        TantivyError::IoError(error.into())
     }
 }
 

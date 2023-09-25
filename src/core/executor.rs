@@ -1,6 +1,5 @@
+use crossbeam::channel;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-
-use crate::TantivyError;
 
 /// Search executor whether search request are single thread or multithread.
 ///
@@ -26,7 +25,7 @@ impl Executor {
     pub fn multi_thread(num_threads: usize, prefix: &'static str) -> crate::Result<Executor> {
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
-            .thread_name(move |num| format!("{prefix}{num}"))
+            .thread_name(move |num| format!("{}{}", prefix, num))
             .build()?;
         Ok(Executor::ThreadPool(pool))
     }
@@ -48,19 +47,16 @@ impl Executor {
         match self {
             Executor::SingleThread => args.map(f).collect::<crate::Result<_>>(),
             Executor::ThreadPool(pool) => {
-                let args: Vec<A> = args.collect();
-                let num_fruits = args.len();
+                let args_with_indices: Vec<(usize, A)> = args.enumerate().collect();
+                let num_fruits = args_with_indices.len();
                 let fruit_receiver = {
-                    let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
+                    let (fruit_sender, fruit_receiver) = channel::unbounded();
                     pool.scope(|scope| {
-                        for (idx, arg) in args.into_iter().enumerate() {
-                            // We name references for f and fruit_sender_ref because we do not
-                            // want these two to be moved into the closure.
-                            let f_ref = &f;
-                            let fruit_sender_ref = &fruit_sender;
-                            scope.spawn(move |_| {
-                                let fruit = f_ref(arg);
-                                if let Err(err) = fruit_sender_ref.send((idx, fruit)) {
+                        for arg_with_idx in args_with_indices {
+                            scope.spawn(|_| {
+                                let (idx, arg) = arg_with_idx;
+                                let fruit = f(arg);
+                                if let Err(err) = fruit_sender.send((idx, fruit)) {
                                     error!(
                                         "Failed to send search task. It probably means all search \
                                          threads have panicked. {:?}",
@@ -75,19 +71,18 @@ impl Executor {
                     // This is important as it makes it possible for the fruit_receiver iteration to
                     // terminate.
                 };
-                let mut result_placeholders: Vec<Option<R>> =
-                    std::iter::repeat_with(|| None).take(num_fruits).collect();
+                // This is lame, but safe.
+                let mut results_with_position = Vec::with_capacity(num_fruits);
                 for (pos, fruit_res) in fruit_receiver {
                     let fruit = fruit_res?;
-                    result_placeholders[pos] = Some(fruit);
+                    results_with_position.push((pos, fruit));
                 }
-                let results: Vec<R> = result_placeholders.into_iter().flatten().collect();
-                if results.len() != num_fruits {
-                    return Err(TantivyError::InternalError(
-                        "One of the mapped execution failed.".to_string(),
-                    ));
-                }
-                Ok(results)
+                results_with_position.sort_by_key(|(pos, _)| *pos);
+                assert_eq!(results_with_position.len(), num_fruits);
+                Ok(results_with_position
+                    .into_iter()
+                    .map(|(_, fruit)| fruit)
+                    .collect::<Vec<_>>())
             }
         }
     }

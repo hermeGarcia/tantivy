@@ -1,11 +1,13 @@
 use std::io;
 
-use stacker::Addr;
-
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::postings::postings_writer::SpecializedPostingsWriter;
-use crate::postings::recorder::{BufferLender, DocIdRecorder, Recorder};
-use crate::postings::{FieldSerializer, IndexingContext, IndexingPosition, PostingsWriter};
+use crate::postings::recorder::{BufferLender, NothingRecorder, Recorder};
+use crate::postings::stacker::Addr;
+use crate::postings::{
+    FieldSerializer, IndexingContext, IndexingPosition, PostingsWriter, UnorderedTermId,
+};
+use crate::schema::term::as_json_path_type_value_bytes;
 use crate::schema::Type;
 use crate::tokenizer::TokenStream;
 use crate::{DocId, Term};
@@ -13,7 +15,7 @@ use crate::{DocId, Term};
 #[derive(Default)]
 pub(crate) struct JsonPostingsWriter<Rec: Recorder> {
     str_posting_writer: SpecializedPostingsWriter<Rec>,
-    non_str_posting_writer: SpecializedPostingsWriter<DocIdRecorder>,
+    non_str_posting_writer: SpecializedPostingsWriter<NothingRecorder>,
 }
 
 impl<Rec: Recorder> From<JsonPostingsWriter<Rec>> for Box<dyn PostingsWriter> {
@@ -23,15 +25,14 @@ impl<Rec: Recorder> From<JsonPostingsWriter<Rec>> for Box<dyn PostingsWriter> {
 }
 
 impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
-    #[inline]
     fn subscribe(
         &mut self,
         doc: crate::DocId,
         pos: u32,
         term: &crate::Term,
         ctx: &mut IndexingContext,
-    ) {
-        self.non_str_posting_writer.subscribe(doc, pos, term, ctx);
+    ) -> UnorderedTermId {
+        self.non_str_posting_writer.subscribe(doc, pos, term, ctx)
     }
 
     fn index_text(
@@ -54,15 +55,15 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
     /// The actual serialization format is handled by the `PostingsSerializer`.
     fn serialize(
         &self,
-        term_addrs: &[(Term<&[u8]>, Addr)],
+        term_addrs: &[(Term<&[u8]>, Addr, UnorderedTermId)],
         doc_id_map: Option<&DocIdMapping>,
         ctx: &IndexingContext,
         serializer: &mut FieldSerializer,
     ) -> io::Result<()> {
         let mut buffer_lender = BufferLender::default();
-        for (term, addr) in term_addrs {
-            if let Some(json_value) = term.value().as_json_value_bytes() {
-                let typ = json_value.typ();
+        for (term, addr, _) in term_addrs {
+            // TODO optimization opportunity here.
+            if let Some((_, typ, _)) = as_json_path_type_value_bytes(term.value_bytes()) {
                 if typ == Type::Str {
                     SpecializedPostingsWriter::<Rec>::serialize_one_term(
                         term,
@@ -73,7 +74,7 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
                         serializer,
                     )?;
                 } else {
-                    SpecializedPostingsWriter::<DocIdRecorder>::serialize_one_term(
+                    SpecializedPostingsWriter::<NothingRecorder>::serialize_one_term(
                         term,
                         *addr,
                         doc_id_map,

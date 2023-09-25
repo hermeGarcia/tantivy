@@ -1,66 +1,50 @@
 use std::io;
 
 mod merger;
+mod sstable;
+mod streamer;
+mod termdict;
 
 use std::iter::ExactSizeIterator;
 
 use common::VInt;
-use sstable::value::{ValueReader, ValueWriter};
-use sstable::SSTable;
-use tantivy_fst::automaton::AlwaysMatch;
 
 pub use self::merger::TermMerger;
+use self::sstable::value::{ValueReader, ValueWriter};
+use self::sstable::{BlockReader, SSTable};
+pub use self::streamer::{TermStreamer, TermStreamerBuilder};
+pub use self::termdict::{TermDictionary, TermDictionaryBuilder};
 use crate::postings::TermInfo;
 
-/// The term dictionary contains all of the terms in
-/// `tantivy index` in a sorted manner.
-///
-/// The `Fst` crate is used to associate terms to their
-/// respective `TermOrdinal`. The `TermInfoStore` then makes it
-/// possible to fetch the associated `TermInfo`.
-pub type TermDictionary = sstable::Dictionary<TermSSTable>;
-
-/// Builder for the new term dictionary.
-pub type TermDictionaryBuilder<W> = sstable::Writer<W, TermInfoValueWriter>;
-
-/// `TermStreamer` acts as a cursor over a range of terms of a segment.
-/// Terms are guaranteed to be sorted.
-pub type TermStreamer<'a, A = AlwaysMatch> = sstable::Streamer<'a, TermSSTable, A>;
-
-/// SSTable used to store TermInfo objects.
 pub struct TermSSTable;
-
-pub type TermStreamerBuilder<'a, A = AlwaysMatch> = sstable::StreamerBuilder<'a, TermSSTable, A>;
 
 impl SSTable for TermSSTable {
     type Value = TermInfo;
-    type ValueReader = TermInfoValueReader;
-    type ValueWriter = TermInfoValueWriter;
+    type Reader = TermInfoReader;
+    type Writer = TermInfoWriter;
 }
 
 #[derive(Default)]
-pub struct TermInfoValueReader {
+pub struct TermInfoReader {
     term_infos: Vec<TermInfo>,
 }
 
-impl ValueReader for TermInfoValueReader {
+impl ValueReader for TermInfoReader {
     type Value = TermInfo;
 
-    #[inline(always)]
     fn value(&self, idx: usize) -> &TermInfo {
         &self.term_infos[idx]
     }
 
-    fn load(&mut self, mut data: &[u8]) -> io::Result<usize> {
-        let len_before = data.len();
+    fn read(&mut self, reader: &mut BlockReader) -> io::Result<()> {
         self.term_infos.clear();
-        let num_els = VInt::deserialize_u64(&mut data)?;
-        let mut postings_start = VInt::deserialize_u64(&mut data)? as usize;
-        let mut positions_start = VInt::deserialize_u64(&mut data)? as usize;
+        let num_els = VInt::deserialize_u64(reader)?;
+        let mut postings_start = VInt::deserialize_u64(reader)? as usize;
+        let mut positions_start = VInt::deserialize_u64(reader)? as usize;
         for _ in 0..num_els {
-            let doc_freq = VInt::deserialize_u64(&mut data)? as u32;
-            let postings_num_bytes = VInt::deserialize_u64(&mut data)?;
-            let positions_num_bytes = VInt::deserialize_u64(&mut data)?;
+            let doc_freq = VInt::deserialize_u64(reader)? as u32;
+            let postings_num_bytes = VInt::deserialize_u64(reader)?;
+            let positions_num_bytes = VInt::deserialize_u64(reader)?;
             let postings_end = postings_start + postings_num_bytes as usize;
             let positions_end = positions_start + positions_num_bytes as usize;
             let term_info = TermInfo {
@@ -72,24 +56,23 @@ impl ValueReader for TermInfoValueReader {
             postings_start = postings_end;
             positions_start = positions_end;
         }
-        let consumed_len = len_before - data.len();
-        Ok(consumed_len)
+        Ok(())
     }
 }
 
 #[derive(Default)]
-pub struct TermInfoValueWriter {
+pub struct TermInfoWriter {
     term_infos: Vec<TermInfo>,
 }
 
-impl ValueWriter for TermInfoValueWriter {
+impl ValueWriter for TermInfoWriter {
     type Value = TermInfo;
 
     fn write(&mut self, term_info: &TermInfo) {
         self.term_infos.push(term_info.clone());
     }
 
-    fn serialize_block(&self, buffer: &mut Vec<u8>) {
+    fn write_block(&mut self, buffer: &mut Vec<u8>) {
         VInt(self.term_infos.len() as u64).serialize_into_vec(buffer);
         if self.term_infos.is_empty() {
             return;
@@ -101,23 +84,23 @@ impl ValueWriter for TermInfoValueWriter {
             VInt(term_info.postings_range.len() as u64).serialize_into_vec(buffer);
             VInt(term_info.positions_range.len() as u64).serialize_into_vec(buffer);
         }
-    }
-
-    fn clear(&mut self) {
         self.term_infos.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use sstable::value::{ValueReader, ValueWriter};
+    use std::io;
 
+    use super::BlockReader;
+    use crate::directory::OwnedBytes;
     use crate::postings::TermInfo;
-    use crate::termdict::sstable_termdict::TermInfoValueReader;
+    use crate::termdict::sstable_termdict::sstable::value::{ValueReader, ValueWriter};
+    use crate::termdict::sstable_termdict::TermInfoReader;
 
     #[test]
-    fn test_block_terminfos() {
-        let mut term_info_writer = super::TermInfoValueWriter::default();
+    fn test_block_terminfos() -> io::Result<()> {
+        let mut term_info_writer = super::TermInfoWriter::default();
         term_info_writer.write(&TermInfo {
             doc_freq: 120u32,
             postings_range: 17..45,
@@ -134,9 +117,10 @@ mod tests {
             positions_range: 1100..1302,
         });
         let mut buffer = Vec::new();
-        term_info_writer.serialize_block(&mut buffer);
-        let mut term_info_reader = TermInfoValueReader::default();
-        let num_bytes: usize = term_info_reader.load(&buffer[..]).unwrap();
+        term_info_writer.write_block(&mut buffer);
+        let mut block_reader = make_block_reader(&buffer[..]);
+        let mut term_info_reader = TermInfoReader::default();
+        term_info_reader.read(&mut block_reader)?;
         assert_eq!(
             term_info_reader.value(0),
             &TermInfo {
@@ -145,6 +129,16 @@ mod tests {
                 positions_range: 10..122
             }
         );
-        assert_eq!(buffer.len(), num_bytes);
+        assert!(block_reader.buffer().is_empty());
+        Ok(())
+    }
+
+    fn make_block_reader(data: &[u8]) -> BlockReader {
+        let mut buffer = (data.len() as u32).to_le_bytes().to_vec();
+        buffer.extend_from_slice(data);
+        let owned_bytes = OwnedBytes::new(buffer);
+        let mut block_reader = BlockReader::new(Box::new(owned_bytes));
+        block_reader.read_block().unwrap();
+        block_reader
     }
 }

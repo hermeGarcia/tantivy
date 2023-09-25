@@ -1,29 +1,24 @@
 use std::str::CharIndices;
 
-use super::{Token, TokenStream, Tokenizer};
+use super::{BoxTokenStream, Token, TokenStream, Tokenizer};
 
 /// Tokenize the text by splitting on whitespaces and punctuation.
-#[derive(Clone, Default)]
-pub struct SimpleTokenizer {
-    token: Token,
-}
+#[derive(Clone)]
+pub struct SimpleTokenizer;
 
-/// TokenStream produced by the `SimpleTokenizer`.
 pub struct SimpleTokenStream<'a> {
     text: &'a str,
     chars: CharIndices<'a>,
-    token: &'a mut Token,
+    token: Token,
 }
 
 impl Tokenizer for SimpleTokenizer {
-    type TokenStream<'a> = SimpleTokenStream<'a>;
-    fn token_stream<'a>(&'a mut self, text: &'a str) -> SimpleTokenStream<'a> {
-        self.token.reset();
-        SimpleTokenStream {
+    fn token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a> {
+        BoxTokenStream::from(SimpleTokenStream {
             text,
             chars: text.char_indices(),
-            token: &mut self.token,
-        }
+            token: Token::default(),
+        })
     }
 }
 
@@ -31,7 +26,7 @@ impl<'a> SimpleTokenStream<'a> {
     // search for the end of the current token.
     fn search_token_end(&mut self) -> usize {
         (&mut self.chars)
-            .filter(|(_, c)| !c.is_alphanumeric())
+            .filter(|&(_, ref c)| !c.is_alphanumeric())
             .map(|(offset, _)| offset)
             .next()
             .unwrap_or(self.text.len())
@@ -55,11 +50,11 @@ impl<'a> TokenStream for SimpleTokenStream<'a> {
     }
 
     fn token(&self) -> &Token {
-        self.token
+        &self.token
     }
 
     fn token_mut(&mut self) -> &mut Token {
-        self.token
+        &mut self.token
     }
 }
 
@@ -79,7 +74,7 @@ mod tests {
     }
 
     fn token_stream_helper(text: &str) -> Vec<Token> {
-        let mut a = TextAnalyzer::from(SimpleTokenizer::default());
+        let a = TextAnalyzer::from(SimpleTokenizer);
         let mut token_stream = a.token_stream(text);
         let mut tokens: Vec<Token> = vec![];
         let mut add_token = |token: &Token| {

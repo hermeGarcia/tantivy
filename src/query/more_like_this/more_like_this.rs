@@ -4,7 +4,7 @@ use std::collections::{BinaryHeap, HashMap};
 use crate::query::bm25::idf;
 use crate::query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery};
 use crate::schema::{Field, FieldType, IndexRecordOption, Term, Value};
-use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TokenStream, Tokenizer};
+use crate::tokenizer::{BoxTokenStream, FacetTokenizer, PreTokenizedStream, Tokenizer};
 use crate::{DocAddress, Result, Searcher, TantivyError};
 
 #[derive(Debug, PartialEq)]
@@ -23,21 +23,19 @@ impl Eq for ScoreTerm {}
 
 impl PartialOrd for ScoreTerm {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+        self.score.partial_cmp(&other.score)
     }
 }
 
 impl Ord for ScoreTerm {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.score
-            .partial_cmp(&other.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
-/// A struct used as helper to build [`MoreLikeThisQuery`](crate::query::MoreLikeThisQuery)
-/// This more-like-this implementation is inspired by the Apache Lucene
-/// and closely follows the same implementation with adaptation to Tantivy vocabulary and API.
+/// A struct used as helper to build [`MoreLikeThisQuery`]
+/// This more-like-this implementation is inspired by the Appache Lucene
+/// amd closely follows the same implementation with adaptabtion to Tantivy vocabulary and API.
 ///
 /// [MoreLikeThis](https://github.com/apache/lucene/blob/main/lucene/queries/src/java/org/apache/lucene/queries/mlt/MoreLikeThis.java#L147)
 /// [MoreLikeThisQuery](https://github.com/apache/lucene/blob/main/lucene/queries/src/java/org/apache/lucene/queries/mlt/MoreLikeThisQuery.java#L36)
@@ -141,7 +139,7 @@ impl MoreLikeThis {
     }
 
     /// Finds terms for a more-like-this query.
-    /// field_to_field_values is a mapping from field to possible values of that field.
+    /// field_to_field_values is a mapping from field to possible values of taht field.
     fn retrieve_terms_from_doc_fields(
         &self,
         searcher: &Searcher,
@@ -192,47 +190,44 @@ impl MoreLikeThis {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 for fake_str in facets {
-                    FacetTokenizer::default()
-                        .token_stream(fake_str)
-                        .process(&mut |token| {
-                            if self.is_noise_word(token.text.clone()) {
-                                let term = Term::from_field_text(field, &token.text);
-                                *term_frequencies.entry(term).or_insert(0) += 1;
-                            }
-                        });
+                    FacetTokenizer.token_stream(fake_str).process(&mut |token| {
+                        if self.is_noise_word(token.text.clone()) {
+                            let term = Term::from_field_text(field, &token.text);
+                            *term_frequencies.entry(term).or_insert(0) += 1;
+                        }
+                    });
                 }
             }
             FieldType::Str(text_options) => {
+                let mut token_streams: Vec<BoxTokenStream> = vec![];
+
                 for value in values {
                     match value {
                         Value::PreTokStr(tok_str) => {
-                            let mut token_stream = PreTokenizedStream::from(tok_str.clone());
-                            token_stream.process(&mut |token| {
-                                if !self.is_noise_word(token.text.clone()) {
-                                    let term = Term::from_field_text(field, &token.text);
-                                    *term_frequencies.entry(term).or_insert(0) += 1;
-                                }
-                            });
+                            token_streams.push(PreTokenizedStream::from(tok_str.clone()).into());
                         }
                         Value::Str(ref text) => {
-                            if let Some(mut tokenizer) = text_options
+                            if let Some(tokenizer) = text_options
                                 .get_indexing_options()
                                 .map(|text_indexing_options| {
                                     text_indexing_options.tokenizer().to_string()
                                 })
                                 .and_then(|tokenizer_name| tokenizer_manager.get(&tokenizer_name))
                             {
-                                let mut token_stream = tokenizer.token_stream(text);
-                                token_stream.process(&mut |token| {
-                                    if !self.is_noise_word(token.text.clone()) {
-                                        let term = Term::from_field_text(field, &token.text);
-                                        *term_frequencies.entry(term).or_insert(0) += 1;
-                                    }
-                                });
+                                token_streams.push(tokenizer.token_stream(text));
                             }
                         }
                         _ => (),
                     }
+                }
+
+                for mut token_stream in token_streams {
+                    token_stream.process(&mut |token| {
+                        if !self.is_noise_word(token.text.clone()) {
+                            let term = Term::from_field_text(field, &token.text);
+                            *term_frequencies.entry(term).or_insert(0) += 1;
+                        }
+                    });
                 }
             }
             FieldType::U64(_) => {
@@ -248,11 +243,15 @@ impl MoreLikeThis {
             }
             FieldType::Date(_) => {
                 for value in values {
-                    let timestamp = value.as_date().ok_or_else(|| {
-                        TantivyError::InvalidArgument("invalid value".to_string())
-                    })?;
-                    let term = Term::from_field_date(field, timestamp);
-                    *term_frequencies.entry(term).or_insert(0) += 1;
+                    // TODO: Ask if this is the semantic (timestamp) we want
+                    let val = value
+                        .as_date()
+                        .ok_or_else(|| TantivyError::InvalidArgument("invalid value".to_string()))?
+                        .timestamp();
+                    if !self.is_noise_word(val.to_string()) {
+                        let term = Term::from_field_i64(field, val);
+                        *term_frequencies.entry(term).or_insert(0) += 1;
+                    }
                 }
             }
             FieldType::I64(_) => {

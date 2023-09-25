@@ -1,7 +1,5 @@
-use common::TerminatingWrite;
-
 use crate::core::{Segment, SegmentComponent};
-use crate::directory::WritePtr;
+use crate::fastfield::CompositeFastFieldSerializer;
 use crate::fieldnorm::FieldNormsSerializer;
 use crate::postings::InvertedIndexSerializer;
 use crate::store::StoreWriter;
@@ -11,7 +9,7 @@ use crate::store::StoreWriter;
 pub struct SegmentSerializer {
     segment: Segment,
     pub(crate) store_writer: StoreWriter,
-    fast_field_write: WritePtr,
+    fast_field_serializer: CompositeFastFieldSerializer,
     fieldnorms_serializer: Option<FieldNormsSerializer>,
     postings_serializer: InvertedIndexSerializer,
 }
@@ -26,38 +24,25 @@ impl SegmentSerializer {
         // In the merge case this is not necessary because we can kmerge the already sorted
         // segments
         let remapping_required = segment.index().settings().sort_by_field.is_some() && !is_in_merge;
-        let settings = segment.index().settings().clone();
-        let store_writer = if remapping_required {
-            let store_write = segment.open_write(SegmentComponent::TempStore)?;
-            StoreWriter::new(
-                store_write,
-                crate::store::Compressor::None,
-                // We want fast random access on the docs, so we choose a small block size.
-                // If this is zero, the skip index will contain too many checkpoints and
-                // therefore will be relatively slow.
-                16000,
-                settings.docstore_compress_dedicated_thread,
-            )?
+        let store_component = if remapping_required {
+            SegmentComponent::TempStore
         } else {
-            let store_write = segment.open_write(SegmentComponent::Store)?;
-            StoreWriter::new(
-                store_write,
-                settings.docstore_compression,
-                settings.docstore_blocksize,
-                settings.docstore_compress_dedicated_thread,
-            )?
+            SegmentComponent::Store
         };
+        let store_write = segment.open_write(store_component)?;
 
         let fast_field_write = segment.open_write(SegmentComponent::FastFields)?;
+        let fast_field_serializer = CompositeFastFieldSerializer::from_write(fast_field_write)?;
 
         let fieldnorms_write = segment.open_write(SegmentComponent::FieldNorms)?;
         let fieldnorms_serializer = FieldNormsSerializer::from_write(fieldnorms_write)?;
 
         let postings_serializer = InvertedIndexSerializer::open(&mut segment)?;
+        let compressor = segment.index().settings().docstore_compression;
         Ok(SegmentSerializer {
             segment,
-            store_writer,
-            fast_field_write,
+            store_writer: StoreWriter::new(store_write, compressor),
+            fast_field_serializer,
             fieldnorms_serializer: Some(fieldnorms_serializer),
             postings_serializer,
         })
@@ -82,8 +67,8 @@ impl SegmentSerializer {
     }
 
     /// Accessor to the `FastFieldSerializer`.
-    pub fn get_fast_field_write(&mut self) -> &mut WritePtr {
-        &mut self.fast_field_write
+    pub fn get_fast_field_serializer(&mut self) -> &mut CompositeFastFieldSerializer {
+        &mut self.fast_field_serializer
     }
 
     /// Extract the field norm serializer.
@@ -103,7 +88,7 @@ impl SegmentSerializer {
         if let Some(fieldnorms_serializer) = self.extract_fieldnorms_serializer() {
             fieldnorms_serializer.close()?;
         }
-        self.fast_field_write.terminate()?;
+        self.fast_field_serializer.close()?;
         self.postings_serializer.close()?;
         self.store_writer.close()?;
         Ok(())

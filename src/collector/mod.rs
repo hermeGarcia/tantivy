@@ -4,13 +4,13 @@
 //! In tantivy jargon, we call this information your search "fruit".
 //!
 //! Your fruit could for instance be :
-//! - [the count of matching documents](crate::collector::Count)
-//! - [the top 10 documents, by relevancy or by a fast field](crate::collector::TopDocs)
-//! - [facet counts](FacetCollector)
+//! - [the count of matching documents](./struct.Count.html)
+//! - [the top 10 documents, by relevancy or by a fast field](./struct.TopDocs.html)
+//! - [facet counts](./struct.FacetCollector.html)
 //!
-//! At some point in your code, you will trigger the actual search operation by calling
-//! [`Searcher::search()`](crate::Searcher::search).
-//! This call will look like this:
+//! At one point in your code, you will trigger the actual search operation by calling
+//! [the `search(...)` method of your `Searcher` object](../struct.Searcher.html#method.search).
+//! This call will look like this.
 //!
 //! ```verbatim
 //! let fruit = searcher.search(&query, &collector)?;
@@ -44,7 +44,7 @@
 //! #     let title = schema_builder.add_text_field("title", TEXT);
 //! #     let schema = schema_builder.build();
 //! #     let index = Index::create_in_ram(schema);
-//! #     let mut index_writer = index.writer(15_000_000)?;
+//! #     let mut index_writer = index.writer(3_000_000)?;
 //! #       index_writer.add_document(doc!(
 //! #       title => "The Name of the Wind",
 //! #      ))?;
@@ -64,7 +64,7 @@
 //!
 //! The `Collector` trait is implemented for up to 4 collectors.
 //! If you have more than 4 collectors, you can either group them into
-//! tuples of tuples `(a,(b,(c,d)))`, or rely on [`MultiCollector`].
+//! tuples of tuples `(a,(b,(c,d)))`, or rely on [`MultiCollector`](./struct.MultiCollector.html).
 //!
 //! # Combining several collectors dynamically
 //!
@@ -74,7 +74,7 @@
 //!
 //! Unfortunately it requires you to know at compile time your collector types.
 //! If on the other hand, the collectors depend on some query parameter,
-//! you can rely on [`MultiCollector`]'s.
+//! you can rely on `MultiCollector`'s.
 //!
 //!
 //! # Implementing your own collectors.
@@ -92,7 +92,7 @@ mod histogram_collector;
 pub use histogram_collector::HistogramCollector;
 
 mod multi_collector;
-pub use self::multi_collector::{FruitHandle, MultiCollector, MultiFruit};
+pub use self::multi_collector::MultiCollector;
 
 mod top_collector;
 
@@ -104,6 +104,7 @@ pub use self::custom_score_top_collector::{CustomScorer, CustomSegmentScorer};
 
 mod tweak_score_top_collector;
 pub use self::tweak_score_top_collector::{ScoreSegmentTweaker, ScoreTweaker};
+
 mod facet_collector;
 pub use self::facet_collector::{FacetCollector, FacetCounts};
 use crate::query::Weight;
@@ -112,7 +113,7 @@ mod docset_collector;
 pub use self::docset_collector::DocSetCollector;
 
 mod filter_collector_wrapper;
-pub use self::filter_collector_wrapper::{BytesFilterCollector, FilterCollector};
+pub use self::filter_collector_wrapper::FilterCollector;
 
 /// `Fruit` is the type for the result of our collection.
 /// e.g. `usize` for the `Count` collector.
@@ -141,7 +142,7 @@ pub trait Collector: Sync + Send {
     /// e.g. `usize` for the `Count` collector.
     type Fruit: Fruit;
 
-    /// Type of the `SegmentCollector` associated with this collector.
+    /// Type of the `SegmentCollector` associated to this collector.
     type Child: SegmentCollector;
 
     /// `set_segment` is called before beginning to enumerate
@@ -155,7 +156,7 @@ pub trait Collector: Sync + Send {
     /// Returns true iff the collector requires to compute scores for documents.
     fn requires_scoring(&self) -> bool;
 
-    /// Combines the fruit associated with the collection of each segments
+    /// Combines the fruit associated to the collection of each segments
     /// into one fruit.
     fn merge_fruits(
         &self,
@@ -169,37 +170,19 @@ pub trait Collector: Sync + Send {
         segment_ord: u32,
         reader: &SegmentReader,
     ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
-        let mut segment_collector = self.for_segment(segment_ord, reader)?;
+        let mut segment_collector = self.for_segment(segment_ord as u32, reader)?;
 
-        match (reader.alive_bitset(), self.requires_scoring()) {
-            (Some(alive_bitset), true) => {
-                weight.for_each(reader, &mut |doc, score| {
-                    if alive_bitset.is_alive(doc) {
-                        segment_collector.collect(doc, score);
-                    }
-                })?;
-            }
-            (Some(alive_bitset), false) => {
-                weight.for_each_no_score(reader, &mut |docs| {
-                    for doc in docs.iter().cloned() {
-                        if alive_bitset.is_alive(doc) {
-                            segment_collector.collect(doc, 0.0);
-                        }
-                    }
-                })?;
-            }
-            (None, true) => {
-                weight.for_each(reader, &mut |doc, score| {
+        if let Some(alive_bitset) = reader.alive_bitset() {
+            weight.for_each(reader, &mut |doc, score| {
+                if alive_bitset.is_alive(doc) {
                     segment_collector.collect(doc, score);
-                })?;
-            }
-            (None, false) => {
-                weight.for_each_no_score(reader, &mut |docs| {
-                    segment_collector.collect_block(docs);
-                })?;
-            }
+                }
+            })?;
+        } else {
+            weight.for_each(reader, &mut |doc, score| {
+                segment_collector.collect(doc, score);
+            })?;
         }
-
         Ok(segment_collector.harvest())
     }
 }
@@ -271,13 +254,6 @@ pub trait SegmentCollector: 'static {
 
     /// The query pushes the scored document to the collector via this method.
     fn collect(&mut self, doc: DocId, score: Score);
-
-    /// The query pushes the scored document to the collector via this method.
-    fn collect_block(&mut self, docs: &[DocId]) {
-        for doc in docs {
-            self.collect(*doc, 0.0);
-        }
-    }
 
     /// Extract the fruit of the collection from the `SegmentCollector`.
     fn harvest(self) -> Self::Fruit;

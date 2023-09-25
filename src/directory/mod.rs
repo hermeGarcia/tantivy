@@ -5,6 +5,7 @@ mod mmap_directory;
 
 mod directory;
 mod directory_lock;
+mod file_slice;
 mod file_watcher;
 mod footer;
 mod managed_directory;
@@ -19,12 +20,14 @@ mod composite_file;
 use std::io::BufWriter;
 use std::path::PathBuf;
 
-pub use common::file_slice::{FileHandle, FileSlice};
-pub use common::{AntiCallToken, OwnedBytes, TerminatingWrite};
+pub use common::{AntiCallToken, TerminatingWrite};
+pub use ownedbytes::OwnedBytes;
 
 pub(crate) use self::composite_file::{CompositeFile, CompositeWrite};
 pub use self::directory::{Directory, DirectoryClone, DirectoryLock};
 pub use self::directory_lock::{Lock, INDEX_WRITER_LOCK, META_LOCK};
+pub(crate) use self::file_slice::{ArcBytes, WeakArcBytes};
+pub use self::file_slice::{FileHandle, FileSlice};
 pub use self::ram_directory::RamDirectory;
 pub use self::watch_event_router::{WatchCallback, WatchCallbackList, WatchHandle};
 

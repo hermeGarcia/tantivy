@@ -8,14 +8,13 @@ use tantivy_fst::Automaton;
 use super::term_info_store::{TermInfoStore, TermInfoStoreWriter};
 use super::{TermStreamer, TermStreamerBuilder};
 use crate::directory::{FileSlice, OwnedBytes};
+use crate::error::DataCorruption;
 use crate::postings::TermInfo;
 use crate::termdict::TermOrdinal;
 
 fn convert_fst_error(e: tantivy_fst::Error) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
 }
-
-const FST_VERSION: u32 = 1;
 
 /// Builder for the new term dictionary.
 ///
@@ -56,7 +55,7 @@ where W: Write
     /// to insert_key and insert_value.
     ///
     /// Prefer using `.insert(key, value)`
-    pub fn insert_key(&mut self, key: &[u8]) -> io::Result<()> {
+    pub(crate) fn insert_key(&mut self, key: &[u8]) -> io::Result<()> {
         self.fst_builder
             .insert(key, self.term_ord)
             .map_err(convert_fst_error)?;
@@ -67,7 +66,7 @@ where W: Write
     /// # Warning
     ///
     /// Horribly dangerous internal API. See `.insert_key(...)`.
-    pub fn insert_value(&mut self, term_info: &TermInfo) -> io::Result<()> {
+    pub(crate) fn insert_value(&mut self, term_info: &TermInfo) -> io::Result<()> {
         self.term_info_store_writer.write_term_info(term_info)?;
         Ok(())
     }
@@ -81,21 +80,16 @@ where W: Write
             self.term_info_store_writer
                 .serialize(&mut counting_writer)?;
             let footer_size = counting_writer.written_bytes();
-            footer_size.serialize(&mut counting_writer)?;
-            FST_VERSION.serialize(&mut counting_writer)?;
+            (footer_size as u64).serialize(&mut counting_writer)?;
         }
         Ok(file)
     }
 }
 
-fn open_fst_index(fst_file: FileSlice) -> io::Result<tantivy_fst::Map<OwnedBytes>> {
+fn open_fst_index(fst_file: FileSlice) -> crate::Result<tantivy_fst::Map<OwnedBytes>> {
     let bytes = fst_file.read_bytes()?;
-    let fst = Fst::new(bytes).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Fst data is corrupted: {:?}", err),
-        )
-    })?;
+    let fst = Fst::new(bytes)
+        .map_err(|err| DataCorruption::comment_only(format!("Fst data is corrupted: {:?}", err)))?;
     Ok(tantivy_fst::Map::from(fst))
 }
 
@@ -120,18 +114,10 @@ pub struct TermDictionary {
 
 impl TermDictionary {
     /// Opens a `TermDictionary`.
-    pub fn open(file: FileSlice) -> io::Result<Self> {
-        let (main_slice, footer_len_slice) = file.split_from_end(12);
+    pub fn open(file: FileSlice) -> crate::Result<Self> {
+        let (main_slice, footer_len_slice) = file.split_from_end(8);
         let mut footer_len_bytes = footer_len_slice.read_bytes()?;
         let footer_size = u64::deserialize(&mut footer_len_bytes)?;
-        let version = u32::deserialize(&mut footer_len_bytes)?;
-        if version != FST_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Unsuported fst version, expected {version}, found {FST_VERSION}",),
-            ));
-        }
-
         let (fst_file_slice, values_file_slice) = main_slice.split_from_end(footer_size as usize);
         let fst_index = open_fst_index(fst_file_slice)?;
         let term_info_store = TermInfoStore::open(values_file_slice)?;
@@ -152,12 +138,12 @@ impl TermDictionary {
         self.term_info_store.num_terms()
     }
 
-    /// Returns the ordinal associated with a given term.
+    /// Returns the ordinal associated to a given term.
     pub fn term_ord<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermOrdinal>> {
         Ok(self.fst_index.get(key))
     }
 
-    /// Stores the term associated with a given term ordinal in
+    /// Stores the term associated to a given term ordinal in
     /// a `bytes` buffer.
     ///
     /// Term ordinals are defined as the position of the term in
@@ -206,7 +192,7 @@ impl TermDictionary {
         TermStreamerBuilder::new(self, self.fst_index.range())
     }
 
-    /// A stream of all the sorted terms.
+    /// A stream of all the sorted terms. [See also `.stream_field()`](#method.stream_field)
     pub fn stream(&self) -> io::Result<TermStreamer<'_>> {
         self.range().into_stream()
     }

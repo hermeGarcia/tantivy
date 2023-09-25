@@ -2,18 +2,16 @@
 //! ```rust
 //! use tantivy::tokenizer::*;
 //!
-//! let mut tokenizer = TextAnalyzer::builder(RawTokenizer::default())
-//!   .filter(AlphaNumOnlyFilter)
-//!   .build();
+//! let tokenizer = TextAnalyzer::from(RawTokenizer)
+//!   .filter(AlphaNumOnlyFilter);
 //!
 //! let mut stream = tokenizer.token_stream("hello there");
 //! // is none because the raw filter emits one token that
 //! // contains a space
 //! assert!(stream.next().is_none());
 //!
-//! let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
-//!   .filter(AlphaNumOnlyFilter)
-//!   .build();
+//! let tokenizer = TextAnalyzer::from(SimpleTokenizer)
+//!   .filter(AlphaNumOnlyFilter);
 //!
 //! let mut stream = tokenizer.token_stream("hello there 💣");
 //! assert!(stream.next().is_some());
@@ -21,45 +19,30 @@
 //! // the "emoji" is dropped because its not an alphanum
 //! assert!(stream.next().is_none());
 //! ```
-use super::{Token, TokenFilter, TokenStream, Tokenizer};
+use super::{BoxTokenStream, Token, TokenFilter, TokenStream};
 
 /// `TokenFilter` that removes all tokens that contain non
 /// ascii alphanumeric characters.
 #[derive(Clone)]
 pub struct AlphaNumOnlyFilter;
 
-pub struct AlphaNumOnlyFilterStream<T> {
-    tail: T,
+pub struct AlphaNumOnlyFilterStream<'a> {
+    tail: BoxTokenStream<'a>,
 }
 
-impl<T> AlphaNumOnlyFilterStream<T> {
+impl<'a> AlphaNumOnlyFilterStream<'a> {
     fn predicate(&self, token: &Token) -> bool {
         token.text.chars().all(|c| c.is_ascii_alphanumeric())
     }
 }
 
 impl TokenFilter for AlphaNumOnlyFilter {
-    type Tokenizer<T: Tokenizer> = AlphaNumOnlyFilterWrapper<T>;
-
-    fn transform<T: Tokenizer>(self, tokenizer: T) -> AlphaNumOnlyFilterWrapper<T> {
-        AlphaNumOnlyFilterWrapper(tokenizer)
+    fn transform<'a>(&self, token_stream: BoxTokenStream<'a>) -> BoxTokenStream<'a> {
+        BoxTokenStream::from(AlphaNumOnlyFilterStream { tail: token_stream })
     }
 }
 
-#[derive(Clone)]
-pub struct AlphaNumOnlyFilterWrapper<T>(T);
-
-impl<T: Tokenizer> Tokenizer for AlphaNumOnlyFilterWrapper<T> {
-    type TokenStream<'a> = AlphaNumOnlyFilterStream<T::TokenStream<'a>>;
-
-    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
-        AlphaNumOnlyFilterStream {
-            tail: self.0.token_stream(text),
-        }
-    }
-}
-
-impl<T: TokenStream> TokenStream for AlphaNumOnlyFilterStream<T> {
+impl<'a> TokenStream for AlphaNumOnlyFilterStream<'a> {
     fn advance(&mut self) -> bool {
         while self.tail.advance() {
             if self.predicate(self.tail.token()) {
@@ -96,9 +79,7 @@ mod tests {
     }
 
     fn token_stream_helper(text: &str) -> Vec<Token> {
-        let mut a = TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(AlphaNumOnlyFilter)
-            .build();
+        let a = TextAnalyzer::from(SimpleTokenizer).filter(AlphaNumOnlyFilter);
         let mut token_stream = a.token_stream(text);
         let mut tokens: Vec<Token> = vec![];
         let mut add_token = |token: &Token| {

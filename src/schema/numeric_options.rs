@@ -2,45 +2,49 @@ use std::ops::BitOr;
 
 use serde::{Deserialize, Serialize};
 
-use super::flags::CoerceFlag;
 use crate::schema::flags::{FastFlag, IndexedFlag, SchemaFlagList, StoredFlag};
 
+/// Express whether a field is single-value or multi-valued.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Cardinality {
+    /// The document must have exactly one value associated to the document.
+    #[serde(rename = "single")]
+    SingleValue,
+    /// The document can have any number of values associated to the document.
+    /// This is more memory and CPU expensive than the SingleValue solution.
+    #[serde(rename = "multi")]
+    MultiValues,
+}
+
 #[deprecated(since = "0.17.0", note = "Use NumericOptions instead.")]
-/// Deprecated use [`NumericOptions`] instead.
+/// Deprecated use [NumericOptions] instead.
 pub type IntOptions = NumericOptions;
 
-/// Define how an `u64`, `i64`, or `f64` field should be handled by tantivy.
+/// Define how an u64, i64, of f64 field should be handled by tantivy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(from = "NumericOptionsDeser")]
 pub struct NumericOptions {
     indexed: bool,
     // This boolean has no effect if the field is not marked as indexed too.
     fieldnorms: bool, // This attribute only has an effect if indexed is true.
-    fast: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fast: Option<Cardinality>,
     stored: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    coerce: bool,
 }
 
-fn is_false(val: &bool) -> bool {
-    !val
-}
-
-/// For backward compatibility we add an intermediary to interpret the
+/// For backward compability we add an intermediary to interpret the
 /// lack of fieldnorms attribute as "true" if and only if indexed.
 ///
 /// (Downstream, for the moment, this attribute is not used anyway if not indexed...)
-/// Note that: newly serialized `NumericOptions` will include the new attribute.
+/// Note that: newly serialized NumericOptions will include the new attribute.
 #[derive(Deserialize)]
 struct NumericOptionsDeser {
     indexed: bool,
     #[serde(default)]
     fieldnorms: Option<bool>, // This attribute only has an effect if indexed is true.
     #[serde(default)]
-    fast: bool,
+    fast: Option<Cardinality>,
     stored: bool,
-    #[serde(default)]
-    coerce: bool,
 }
 
 impl From<NumericOptionsDeser> for NumericOptions {
@@ -50,13 +54,12 @@ impl From<NumericOptionsDeser> for NumericOptions {
             fieldnorms: deser.fieldnorms.unwrap_or(deser.indexed),
             fast: deser.fast,
             stored: deser.stored,
-            coerce: deser.coerce,
         }
     }
 }
 
 impl NumericOptions {
-    /// Returns true iff the value is stored in the doc store.
+    /// Returns true iff the value is stored.
     pub fn is_stored(&self) -> bool {
         self.stored
     }
@@ -71,21 +74,18 @@ impl NumericOptions {
         self.fieldnorms && self.indexed
     }
 
+    /// Returns true iff the value is a fast field and multivalue.
+    pub fn is_multivalue_fast(&self) -> bool {
+        if let Some(cardinality) = self.fast {
+            cardinality == Cardinality::MultiValues
+        } else {
+            false
+        }
+    }
+
     /// Returns true iff the value is a fast field.
     pub fn is_fast(&self) -> bool {
-        self.fast
-    }
-
-    /// Returns true if values should be coerced to numbers.
-    pub fn should_coerce(&self) -> bool {
-        self.coerce
-    }
-
-    /// Try to coerce values if they are not a number. Defaults to false.
-    #[must_use]
-    pub fn set_coerce(mut self) -> Self {
-        self.coerce = true;
-        self
+        self.fast.is_some()
     }
 
     /// Set the field as stored.
@@ -120,13 +120,24 @@ impl NumericOptions {
         self
     }
 
-    /// Set the field as a fast field.
+    /// Set the field as a single-valued fast field.
     ///
     /// Fast fields are designed for random access.
+    /// Access time are similar to a random lookup in an array.
+    /// If more than one value is associated to a fast field, only the last one is
+    /// kept.
     #[must_use]
-    pub fn set_fast(mut self) -> NumericOptions {
-        self.fast = true;
+    pub fn set_fast(mut self, cardinality: Cardinality) -> NumericOptions {
+        self.fast = Some(cardinality);
         self
+    }
+
+    /// Returns the cardinality of the fastfield.
+    ///
+    /// If the field has not been declared as a fastfield, then
+    /// the method returns None.
+    pub fn get_fastfield_cardinality(&self) -> Option<Cardinality> {
+        self.fast
     }
 }
 
@@ -136,26 +147,13 @@ impl From<()> for NumericOptions {
     }
 }
 
-impl From<CoerceFlag> for NumericOptions {
-    fn from(_: CoerceFlag) -> NumericOptions {
-        NumericOptions {
-            indexed: false,
-            fieldnorms: false,
-            stored: false,
-            fast: false,
-            coerce: true,
-        }
-    }
-}
-
 impl From<FastFlag> for NumericOptions {
     fn from(_: FastFlag) -> Self {
         NumericOptions {
             indexed: false,
             fieldnorms: false,
             stored: false,
-            fast: true,
-            coerce: false,
+            fast: Some(Cardinality::SingleValue),
         }
     }
 }
@@ -166,8 +164,7 @@ impl From<StoredFlag> for NumericOptions {
             indexed: false,
             fieldnorms: false,
             stored: true,
-            fast: false,
-            coerce: false,
+            fast: None,
         }
     }
 }
@@ -178,8 +175,7 @@ impl From<IndexedFlag> for NumericOptions {
             indexed: true,
             fieldnorms: true,
             stored: false,
-            fast: false,
-            coerce: false,
+            fast: None,
         }
     }
 }
@@ -193,8 +189,7 @@ impl<T: Into<NumericOptions>> BitOr<T> for NumericOptions {
             indexed: self.indexed | other.indexed,
             fieldnorms: self.fieldnorms | other.fieldnorms,
             stored: self.stored | other.stored,
-            fast: self.fast | other.fast,
-            coerce: self.coerce | other.coerce,
+            fast: self.fast.or(other.fast),
         }
     }
 }
@@ -226,9 +221,8 @@ mod tests {
             &NumericOptions {
                 indexed: true,
                 fieldnorms: true,
-                fast: false,
-                stored: false,
-                coerce: false,
+                fast: None,
+                stored: false
             }
         );
     }
@@ -245,9 +239,8 @@ mod tests {
             &NumericOptions {
                 indexed: false,
                 fieldnorms: false,
-                fast: false,
-                stored: false,
-                coerce: false,
+                fast: None,
+                stored: false
             }
         );
     }
@@ -265,9 +258,8 @@ mod tests {
             &NumericOptions {
                 indexed: true,
                 fieldnorms: false,
-                fast: false,
-                stored: false,
-                coerce: false,
+                fast: None,
+                stored: false
             }
         );
     }
@@ -286,31 +278,8 @@ mod tests {
             &NumericOptions {
                 indexed: false,
                 fieldnorms: true,
-                fast: false,
-                stored: false,
-                coerce: false,
-            }
-        );
-    }
-
-    #[test]
-    fn test_int_options_deser_if_coerce_true() {
-        // this one is kind of useless, at least at the moment
-        let json = r#"{
-            "indexed": false,
-            "fieldnorms": true,
-            "stored": false,
-            "coerce": true
-        }"#;
-        let int_options: NumericOptions = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            &int_options,
-            &NumericOptions {
-                indexed: false,
-                fieldnorms: true,
-                fast: false,
-                stored: false,
-                coerce: true,
+                fast: None,
+                stored: false
             }
         );
     }

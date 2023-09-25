@@ -9,11 +9,13 @@
 
 use std::collections::HashMap;
 
-use common::ByteCount;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::Field;
 use crate::SegmentComponent;
+
+/// Indicates space usage in bytes
+pub type ByteCount = usize;
 
 /// Enum containing any of the possible space usage results for segment components.
 pub enum ComponentSpaceUsage {
@@ -36,7 +38,7 @@ impl SearcherSpaceUsage {
     pub(crate) fn new() -> SearcherSpaceUsage {
         SearcherSpaceUsage {
             segments: Vec::new(),
-            total: Default::default(),
+            total: 0,
         }
     }
 
@@ -206,7 +208,7 @@ impl StoreSpaceUsage {
     }
 }
 
-/// Represents space usage for all of the (field, index) pairs that appear in a `CompositeFile`.
+/// Represents space usage for all of the (field, index) pairs that appear in a CompositeFile.
 ///
 /// A field can appear with a single index (typically 0) or with multiple indexes.
 /// Multiple indexes are used to handle variable length things, where
@@ -217,16 +219,9 @@ pub struct PerFieldSpaceUsage {
 }
 
 impl PerFieldSpaceUsage {
-    pub(crate) fn new(fields: Vec<FieldUsage>) -> PerFieldSpaceUsage {
-        let total = fields.iter().map(FieldUsage::total).sum();
-        let field_usage_map: HashMap<Field, FieldUsage> = fields
-            .into_iter()
-            .map(|field_usage| (field_usage.field(), field_usage))
-            .collect();
-        PerFieldSpaceUsage {
-            fields: field_usage_map,
-            total,
-        }
+    pub(crate) fn new(fields: HashMap<Field, FieldUsage>) -> PerFieldSpaceUsage {
+        let total = fields.values().map(FieldUsage::total).sum();
+        PerFieldSpaceUsage { fields, total }
     }
 
     /// Per field space usage
@@ -243,7 +238,7 @@ impl PerFieldSpaceUsage {
 /// Represents space usage of a given field, breaking it down into the (field, index) pairs that
 /// comprise it.
 ///
-/// See documentation for [`PerFieldSpaceUsage`] for slightly more information.
+/// See documentation for PerFieldSpaceUsage for slightly more information.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FieldUsage {
     field: Field,
@@ -258,7 +253,7 @@ impl FieldUsage {
     pub(crate) fn empty(field: Field) -> FieldUsage {
         FieldUsage {
             field,
-            num_bytes: Default::default(),
+            num_bytes: 0,
             sub_num_bytes: Vec::new(),
         }
     }
@@ -292,7 +287,7 @@ impl FieldUsage {
 mod test {
     use crate::core::Index;
     use crate::schema::{Field, Schema, FAST, INDEXED, STORED, TEXT};
-    use crate::space_usage::PerFieldSpaceUsage;
+    use crate::space_usage::{ByteCount, PerFieldSpaceUsage};
     use crate::Term;
 
     #[test]
@@ -302,14 +297,14 @@ mod test {
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
         let searcher_space_usage = searcher.space_usage().unwrap();
-        assert_eq!(searcher_space_usage.total(), 0u64);
+        assert_eq!(0, searcher_space_usage.total());
     }
 
     fn expect_single_field(
         field_space: &PerFieldSpaceUsage,
         field: &Field,
-        min_size: u64,
-        max_size: u64,
+        min_size: ByteCount,
+        max_size: ByteCount,
     ) {
         assert!(field_space.total() >= min_size);
         assert!(field_space.total() <= max_size);
@@ -351,12 +346,12 @@ mod test {
 
         expect_single_field(segment.termdict(), &name, 1, 512);
         expect_single_field(segment.postings(), &name, 1, 512);
-        assert_eq!(segment.positions().total(), 0);
+        assert_eq!(0, segment.positions().total());
         expect_single_field(segment.fast_fields(), &name, 1, 512);
         expect_single_field(segment.fieldnorms(), &name, 1, 512);
         // TODO: understand why the following fails
         //        assert_eq!(0, segment.store().total());
-        assert_eq!(segment.deletes(), 0);
+        assert_eq!(0, segment.deletes());
         Ok(())
     }
 
@@ -392,11 +387,11 @@ mod test {
         expect_single_field(segment.termdict(), &name, 1, 512);
         expect_single_field(segment.postings(), &name, 1, 512);
         expect_single_field(segment.positions(), &name, 1, 512);
-        assert_eq!(segment.fast_fields().total(), 0);
+        assert_eq!(0, segment.fast_fields().total());
         expect_single_field(segment.fieldnorms(), &name, 1, 512);
         // TODO: understand why the following fails
         //        assert_eq!(0, segment.store().total());
-        assert_eq!(segment.deletes(), 0);
+        assert_eq!(0, segment.deletes());
         Ok(())
     }
 
@@ -428,14 +423,14 @@ mod test {
 
         assert_eq!(4, segment.num_docs());
 
-        assert_eq!(segment.termdict().total(), 0);
-        assert_eq!(segment.postings().total(), 0);
-        assert_eq!(segment.positions().total(), 0);
-        assert_eq!(segment.fast_fields().total(), 0);
-        assert_eq!(segment.fieldnorms().total(), 0);
+        assert_eq!(0, segment.termdict().total());
+        assert_eq!(0, segment.postings().total());
+        assert_eq!(0, segment.positions().total());
+        assert_eq!(0, segment.fast_fields().total());
+        assert_eq!(0, segment.fieldnorms().total());
         assert!(segment.store().total() > 0);
         assert!(segment.store().total() < 512);
-        assert_eq!(segment.deletes(), 0);
+        assert_eq!(0, segment.deletes());
         Ok(())
     }
 
@@ -476,8 +471,8 @@ mod test {
 
         expect_single_field(segment_space_usage.termdict(), &name, 1, 512);
         expect_single_field(segment_space_usage.postings(), &name, 1, 512);
-        assert_eq!(segment_space_usage.positions().total(), 0u64);
-        assert_eq!(segment_space_usage.fast_fields().total(), 0u64);
+        assert_eq!(0, segment_space_usage.positions().total());
+        assert_eq!(0, segment_space_usage.fast_fields().total());
         expect_single_field(segment_space_usage.fieldnorms(), &name, 1, 512);
         assert!(segment_space_usage.deletes() > 0);
         Ok(())

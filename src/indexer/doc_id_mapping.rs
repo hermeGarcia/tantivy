@@ -1,66 +1,57 @@
 //! This module is used when sorting the index by a property, e.g.
 //! to get mappings from old doc_id to new doc_id and vice versa, after sorting
 
-use common::ReadOnlyBitSet;
+use std::cmp::Reverse;
+use std::ops::Index;
 
 use super::SegmentWriter;
 use crate::schema::{Field, Schema};
-use crate::{DocAddress, DocId, IndexSortByField, TantivyError};
-
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub enum MappingType {
-    Stacked,
-    StackedWithDeletes,
-    Shuffled,
-}
+use crate::{DocId, IndexSortByField, Order, SegmentOrdinal, TantivyError};
 
 /// Struct to provide mapping from new doc_id to old doc_id and segment.
 #[derive(Clone)]
 pub(crate) struct SegmentDocIdMapping {
-    pub(crate) new_doc_id_to_old_doc_addr: Vec<DocAddress>,
-    pub(crate) alive_bitsets: Vec<Option<ReadOnlyBitSet>>,
-    mapping_type: MappingType,
+    new_doc_id_to_old_and_segment: Vec<(DocId, SegmentOrdinal)>,
+    is_trivial: bool,
 }
 
 impl SegmentDocIdMapping {
     pub(crate) fn new(
-        new_doc_id_to_old_doc_addr: Vec<DocAddress>,
-        mapping_type: MappingType,
-        alive_bitsets: Vec<Option<ReadOnlyBitSet>>,
+        new_doc_id_to_old_and_segment: Vec<(DocId, SegmentOrdinal)>,
+        is_trivial: bool,
     ) -> Self {
         Self {
-            new_doc_id_to_old_doc_addr,
-            mapping_type,
-            alive_bitsets,
+            new_doc_id_to_old_and_segment,
+            is_trivial,
         }
     }
-
-    pub fn mapping_type(&self) -> MappingType {
-        self.mapping_type
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &(DocId, SegmentOrdinal)> {
+        self.new_doc_id_to_old_and_segment.iter()
     }
-
-    /// Returns an iterator over the old document addresses, ordered by the new document ids.
-    ///
-    /// In the returned `DocAddress`, the `segment_ord` is the ordinal of targeted segment
-    /// in the list of merged segments.
-    pub(crate) fn iter_old_doc_addrs(&self) -> impl Iterator<Item = DocAddress> + '_ {
-        self.new_doc_id_to_old_doc_addr.iter().copied()
+    pub(crate) fn len(&self) -> usize {
+        self.new_doc_id_to_old_and_segment.len()
     }
-
     /// This flags means the segments are simply stacked in the order of their ordinal.
     /// e.g. [(0, 1), .. (n, 1), (0, 2)..., (m, 2)]
     ///
-    /// The different segment may present some deletes, in which case it is expressed by skipping a
-    /// `DocId`. [(0, 1), (0, 3)] <--- here doc_id=0 and doc_id=1 have been deleted
-    ///
-    /// Being trivial is equivalent to having the `new_doc_id_to_old_doc_addr` array sorted.
-    ///
     /// This allows for some optimization.
     pub(crate) fn is_trivial(&self) -> bool {
-        match self.mapping_type {
-            MappingType::Stacked | MappingType::StackedWithDeletes => true,
-            MappingType::Shuffled => false,
-        }
+        self.is_trivial
+    }
+}
+impl Index<usize> for SegmentDocIdMapping {
+    type Output = (DocId, SegmentOrdinal);
+
+    fn index(&self, idx: usize) -> &Self::Output {
+        &self.new_doc_id_to_old_and_segment[idx]
+    }
+}
+impl IntoIterator for SegmentDocIdMapping {
+    type Item = (DocId, SegmentOrdinal);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.new_doc_id_to_old_and_segment.into_iter()
     }
 }
 
@@ -101,11 +92,6 @@ impl DocIdMapping {
     pub fn iter_old_doc_ids(&self) -> impl Iterator<Item = DocId> + Clone + '_ {
         self.new_doc_id_to_old.iter().cloned()
     }
-
-    pub fn old_to_new_ids(&self) -> &[DocId] {
-        &self.old_doc_id_to_new[..]
-    }
-
     /// Remaps a given array to the new doc ids.
     pub fn remap<T: Copy>(&self, els: &[T]) -> Vec<T> {
         self.new_doc_id_to_old
@@ -113,19 +99,13 @@ impl DocIdMapping {
             .map(|old_doc| els[*old_doc as usize])
             .collect()
     }
-    pub fn num_new_doc_ids(&self) -> usize {
-        self.new_doc_id_to_old.len()
-    }
-    pub fn num_old_doc_ids(&self) -> usize {
-        self.old_doc_id_to_new.len()
-    }
 }
 
 pub(crate) fn expect_field_id_for_sort_field(
     schema: &Schema,
     sort_by_field: &IndexSortByField,
 ) -> crate::Result<Field> {
-    schema.get_field(&sort_by_field.field).map_err(|_| {
+    schema.get_field(&sort_by_field.field).ok_or_else(|| {
         TantivyError::InvalidArgument(format!(
             "field to sort index by not found: {:?}",
             sort_by_field.field
@@ -140,23 +120,40 @@ pub(crate) fn get_doc_id_mapping_from_field(
     segment_writer: &SegmentWriter,
 ) -> crate::Result<DocIdMapping> {
     let schema = segment_writer.segment_serializer.segment().schema();
-    expect_field_id_for_sort_field(&schema, &sort_by_field)?; // for now expect
-    let new_doc_id_to_old = segment_writer.fast_field_writers.sort_order(
-        sort_by_field.field.as_str(),
-        segment_writer.max_doc(),
-        sort_by_field.order.is_desc(),
-    );
+    let field_id = expect_field_id_for_sort_field(&schema, &sort_by_field)?; // for now expect fastfield, but not strictly required
+    let fast_field = segment_writer
+        .fast_field_writers
+        .get_field_writer(field_id)
+        .ok_or_else(|| {
+            TantivyError::InvalidArgument(format!(
+                "sort index by field is required to be a fast field {:?}",
+                sort_by_field.field
+            ))
+        })?;
+
     // create new doc_id to old doc_id index (used in fast_field_writers)
+    let mut doc_id_and_data = fast_field
+        .iter()
+        .enumerate()
+        .map(|el| (el.0 as DocId, el.1))
+        .collect::<Vec<_>>();
+    if sort_by_field.order == Order::Desc {
+        doc_id_and_data.sort_by_key(|k| Reverse(k.1));
+    } else {
+        doc_id_and_data.sort_by_key(|k| k.1);
+    }
+    let new_doc_id_to_old = doc_id_and_data
+        .into_iter()
+        .map(|el| el.0)
+        .collect::<Vec<_>>();
     Ok(DocIdMapping::from_new_id_to_old_id(new_doc_id_to_old))
 }
 
 #[cfg(test)]
 mod tests_indexsorting {
-    use common::DateTime;
-
     use crate::collector::TopDocs;
+    use crate::fastfield::FastFieldReader;
     use crate::indexer::doc_id_mapping::DocIdMapping;
-    use crate::indexer::NoMergePolicy;
     use crate::query::QueryParser;
     use crate::schema::{Schema, *};
     use crate::{DocAddress, Index, IndexSettings, IndexSortByField, Order};
@@ -169,11 +166,15 @@ mod tests_indexsorting {
 
         let my_text_field = schema_builder.add_text_field("text_field", text_field_options);
         let my_string_field = schema_builder.add_text_field("string_field", STRING | STORED);
-        let my_number =
-            schema_builder.add_u64_field("my_number", NumericOptions::default().set_fast());
+        let my_number = schema_builder.add_u64_field(
+            "my_number",
+            NumericOptions::default().set_fast(Cardinality::SingleValue),
+        );
 
-        let multi_numbers =
-            schema_builder.add_u64_field("multi_numbers", NumericOptions::default().set_fast());
+        let multi_numbers = schema_builder.add_u64_field(
+            "multi_numbers",
+            NumericOptions::default().set_fast(Cardinality::MultiValues),
+        );
 
         let schema = schema_builder.build();
         let mut index_builder = Index::builder().schema(schema);
@@ -468,70 +469,25 @@ mod tests_indexsorting {
         assert_eq!(searcher.segment_readers().len(), 1);
         let segment_reader = searcher.segment_reader(0);
         let fast_fields = segment_reader.fast_fields();
+        let my_number = index.schema().get_field("my_number").unwrap();
 
-        let fast_field = fast_fields
-            .u64("my_number")
-            .unwrap()
-            .first_or_default_col(999);
-        assert_eq!(fast_field.get_val(0), 10u64);
-        assert_eq!(fast_field.get_val(1), 20u64);
-        assert_eq!(fast_field.get_val(2), 30u64);
+        let fast_field = fast_fields.u64(my_number).unwrap();
+        assert_eq!(fast_field.get(0u32), 10u64);
+        assert_eq!(fast_field.get(1u32), 20u64);
+        assert_eq!(fast_field.get(2u32), 30u64);
 
-        let multifield = fast_fields.u64("multi_numbers").unwrap();
-        let vals: Vec<u64> = multifield.values_for_doc(0u32).collect();
+        let multi_numbers = index.schema().get_field("multi_numbers").unwrap();
+        let multifield = fast_fields.u64s(multi_numbers).unwrap();
+        let mut vals = vec![];
+        multifield.get_vals(0u32, &mut vals);
         assert_eq!(vals, &[] as &[u64]);
-        let vals: Vec<_> = multifield.values_for_doc(1u32).collect();
+        let mut vals = vec![];
+        multifield.get_vals(1u32, &mut vals);
         assert_eq!(vals, &[5, 6]);
 
-        let vals: Vec<_> = multifield.values_for_doc(2u32).collect();
+        let mut vals = vec![];
+        multifield.get_vals(2u32, &mut vals);
         assert_eq!(vals, &[3]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_with_sort_by_date_field() -> crate::Result<()> {
-        let mut schema_builder = Schema::builder();
-        let date_field = schema_builder.add_date_field("date", INDEXED | STORED | FAST);
-        let schema = schema_builder.build();
-
-        let settings = IndexSettings {
-            sort_by_field: Some(IndexSortByField {
-                field: "date".to_string(),
-                order: Order::Desc,
-            }),
-            ..Default::default()
-        };
-
-        let index = Index::builder()
-            .schema(schema)
-            .settings(settings)
-            .create_in_ram()?;
-        let mut index_writer = index.writer_for_tests()?;
-        index_writer.set_merge_policy(Box::new(NoMergePolicy));
-
-        index_writer.add_document(doc!(
-            date_field => DateTime::from_timestamp_secs(1000),
-        ))?;
-        index_writer.add_document(doc!(
-            date_field => DateTime::from_timestamp_secs(999),
-        ))?;
-        index_writer.add_document(doc!(
-            date_field => DateTime::from_timestamp_secs(1001),
-        ))?;
-        index_writer.commit()?;
-
-        let searcher = index.reader()?.searcher();
-        assert_eq!(searcher.segment_readers().len(), 1);
-        let segment_reader = searcher.segment_reader(0);
-        let fast_fields = segment_reader.fast_fields();
-
-        let fast_field = fast_fields
-            .date("date")
-            .unwrap()
-            .first_or_default_col(DateTime::from_timestamp_secs(0));
-        assert_eq!(fast_field.get_val(0), DateTime::from_timestamp_secs(1001));
-        assert_eq!(fast_field.get_val(1), DateTime::from_timestamp_secs(1000));
-        assert_eq!(fast_field.get_val(2), DateTime::from_timestamp_secs(999));
         Ok(())
     }
 

@@ -4,8 +4,9 @@ use std::sync::Arc;
 use tantivy_fst::Regex;
 
 use crate::error::TantivyError;
-use crate::query::{AutomatonWeight, EnableScoring, Query, Weight};
+use crate::query::{AutomatonWeight, Query, Weight};
 use crate::schema::Field;
+use crate::Searcher;
 
 /// A Regex Query matches all of the documents
 /// containing a specific term that matches
@@ -26,7 +27,7 @@ use crate::schema::Field;
 /// let schema = schema_builder.build();
 /// let index = Index::create_in_ram(schema);
 /// {
-///     let mut index_writer = index.writer(15_000_000)?;
+///     let mut index_writer = index.writer(3_000_000)?;
 ///     index_writer.add_document(doc!(
 ///         title => "The Name of the Wind",
 ///     ))?;
@@ -81,7 +82,11 @@ impl RegexQuery {
 }
 
 impl Query for RegexQuery {
-    fn weight(&self, _enabled_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+    fn weight(
+        &self,
+        _searcher: &Searcher,
+        _scoring_enabled: bool,
+    ) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(self.specialized_weight()))
     }
 }

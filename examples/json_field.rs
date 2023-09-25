@@ -1,8 +1,7 @@
 // # Json field example
 //
 // This example shows how the json field can be used
-// to make tantivy partially schemaless by setting it as
-// default query parser field.
+// to make tantivy partially schemaless.
 
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
@@ -11,6 +10,10 @@ use tantivy::Index;
 
 fn main() -> tantivy::Result<()> {
     // # Defining the schema
+    //
+    // We need two fields:
+    // - a timestamp
+    // - a json object field
     let mut schema_builder = Schema::builder();
     schema_builder.add_date_field("timestamp", FAST | STORED);
     let event_type = schema_builder.add_text_field("event_type", STRING | STORED);
@@ -40,8 +43,7 @@ fn main() -> tantivy::Result<()> {
         "attributes": {
             "target": "submit-button",
             "cart": {"product_id": 133},
-            "description": "das keyboard",
-            "event_type": "holiday-sale"
+            "description": "das keyboard"
         }
     }"#,
     )?;
@@ -51,9 +53,6 @@ fn main() -> tantivy::Result<()> {
     let reader = index.reader()?;
     let searcher = reader.searcher();
 
-    // # Default fields: event_type and attributes
-    // By setting attributes as a default field it allows omitting attributes itself, e.g. "target",
-    // instead of "attributes.target"
     let query_parser = QueryParser::for_index(&index, vec![event_type, attributes]);
     {
         let query = query_parser.parse_query("target:submit-button")?;
@@ -71,34 +70,10 @@ fn main() -> tantivy::Result<()> {
         assert_eq!(count_docs, 1);
     }
     {
-        let query = query_parser.parse_query("click AND cart.product_id:133")?;
-        let hits = searcher.search(&*query, &TopDocs::with_limit(2))?;
-        assert_eq!(hits.len(), 1);
-    }
-    {
-        // The sub-fields in the json field marked as default field still need to be explicitly
-        // addressed
-        let query = query_parser.parse_query("click AND 133")?;
-        let hits = searcher.search(&*query, &TopDocs::with_limit(2))?;
-        assert_eq!(hits.len(), 0);
-    }
-    {
-        // Default json fields are ignored if they collide with the schema
-        let query = query_parser.parse_query("event_type:holiday-sale")?;
-        let hits = searcher.search(&*query, &TopDocs::with_limit(2))?;
-        assert_eq!(hits.len(), 0);
-    }
-    // # Query via full attribute path
-    {
-        // This only searches in our schema's `event_type` field
-        let query = query_parser.parse_query("event_type:click")?;
-        let hits = searcher.search(&*query, &TopDocs::with_limit(2))?;
-        assert_eq!(hits.len(), 2);
-    }
-    {
-        // Default json fields can still be accessed by full path
-        let query = query_parser.parse_query("attributes.event_type:holiday-sale")?;
-        let hits = searcher.search(&*query, &TopDocs::with_limit(2))?;
+        let query = query_parser
+            .parse_query("event_type:click AND cart.product_id:133")
+            .unwrap();
+        let hits = searcher.search(&*query, &TopDocs::with_limit(2)).unwrap();
         assert_eq!(hits.len(), 1);
     }
     Ok(())

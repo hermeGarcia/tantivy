@@ -1,10 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use super::ip_options::IpAddrOptions;
 use crate::schema::bytes_options::BytesOptions;
 use crate::schema::{
-    is_valid_field_name, DateOptions, FacetOptions, FieldType, JsonObjectOptions, NumericOptions,
-    TextOptions,
+    is_valid_field_name, FacetOptions, FieldType, JsonObjectOptions, NumericOptions, TextOptions,
 };
 
 /// A `FieldEntry` represents a field and its configuration.
@@ -51,19 +49,9 @@ impl FieldEntry {
         Self::new(field_name, FieldType::F64(f64_options))
     }
 
-    /// Creates a new bool field entry.
-    pub fn new_bool(field_name: String, bool_options: NumericOptions) -> FieldEntry {
-        Self::new(field_name, FieldType::Bool(bool_options))
-    }
-
     /// Creates a new date field entry.
-    pub fn new_date(field_name: String, date_options: DateOptions) -> FieldEntry {
+    pub fn new_date(field_name: String, date_options: NumericOptions) -> FieldEntry {
         Self::new(field_name, FieldType::Date(date_options))
-    }
-
-    /// Creates a new ip address field entry.
-    pub fn new_ip_addr(field_name: String, ip_options: IpAddrOptions) -> FieldEntry {
-        Self::new(field_name, FieldType::IpAddr(ip_options))
     }
 
     /// Creates a field entry for a facet.
@@ -103,9 +91,15 @@ impl FieldEntry {
         self.field_type.has_fieldnorms()
     }
 
-    /// Returns true if the field is a fast field
+    /// Returns true if the field is a int (signed or unsigned) fast field
     pub fn is_fast(&self) -> bool {
-        self.field_type.is_fast()
+        match self.field_type {
+            FieldType::U64(ref options)
+            | FieldType::I64(ref options)
+            | FieldType::Date(ref options)
+            | FieldType::F64(ref options) => options.is_fast(),
+            _ => false,
+        }
     }
 
     /// Returns true if the field is stored
@@ -114,13 +108,11 @@ impl FieldEntry {
             FieldType::U64(ref options)
             | FieldType::I64(ref options)
             | FieldType::F64(ref options)
-            | FieldType::Bool(ref options) => options.is_stored(),
-            FieldType::Date(ref options) => options.is_stored(),
+            | FieldType::Date(ref options) => options.is_stored(),
             FieldType::Str(ref options) => options.is_stored(),
             FieldType::Facet(ref options) => options.is_stored(),
             FieldType::Bytes(ref options) => options.is_stored(),
             FieldType::JsonObject(ref options) => options.is_stored(),
-            FieldType::IpAddr(ref options) => options.is_stored(),
         }
     }
 }
@@ -152,8 +144,7 @@ mod tests {
       "fieldnorms": true,
       "tokenizer": "default"
     },
-    "stored": false,
-    "fast": false
+    "stored": false
   }
 }"#;
         let field_value_json = serde_json::to_string_pretty(&field_value).unwrap();

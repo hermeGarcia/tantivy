@@ -2,9 +2,8 @@ use tantivy_fst::map::{OpBuilder, Union};
 use tantivy_fst::raw::IndexedValue;
 use tantivy_fst::Streamer;
 
-use super::termdict::TermDictionary;
 use crate::postings::TermInfo;
-use crate::termdict::{TermOrdinal, TermStreamer};
+use crate::termdict::{TermDictionary, TermOrdinal, TermStreamer};
 
 /// Given a list of sorted term streams,
 /// returns an iterator over sorted unique terms.
@@ -37,10 +36,10 @@ impl<'a> TermMerger<'a> {
         }
     }
 
-    /// Iterator over `(segment ordinal, TermOrdinal)` pairs sorted by segment ordinal
+    /// Iterator over (segment ordinal, [TermOrdinal]) sorted by segment ordinal
     ///
     /// This method may be called
-    /// if [`Self::advance`] has been called before
+    /// if [Self::advance] has been called before
     /// and `true` was returned.
     pub fn matching_segments<'b: 'a>(&'b self) -> impl 'b + Iterator<Item = (usize, TermOrdinal)> {
         self.current_segment_and_term_ordinals
@@ -69,15 +68,17 @@ impl<'a> TermMerger<'a> {
 
     /// Returns the current term.
     ///
-    /// This method may be called if [`Self::advance`] has been called before
+    /// This method may be called
+    /// if [Self::advance] has been called before
     /// and `true` was returned.
     pub fn key(&self) -> &[u8] {
         &self.current_key
     }
 
-    /// Iterator over `(segment ordinal, TermInfo)` pairs sorted by the ordinal.
+    /// Iterator over (segment ordinal, [TermInfo]) pairs iterator sorted by the ordinal.
     ///
-    /// This method may be called if [`Self::advance`] has been called before
+    /// This method may be called
+    /// if [Self::advance] has been called before
     /// and `true` was returned.
     pub fn current_segment_ords_and_term_infos<'b: 'a>(
         &'b self,
@@ -114,7 +115,7 @@ mod bench {
     }
 
     /// Create a dictionary of random strings.
-    fn rand_dict(num_terms: usize) -> std::io::Result<TermDictionary> {
+    fn rand_dict(num_terms: usize) -> crate::Result<TermDictionary> {
         let buffer: Vec<u8> = {
             let mut terms = vec![];
             for _i in 0..num_terms {

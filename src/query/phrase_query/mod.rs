@@ -3,7 +3,6 @@ mod phrase_scorer;
 mod phrase_weight;
 
 pub use self::phrase_query::PhraseQuery;
-pub(crate) use self::phrase_scorer::intersection_count;
 pub use self::phrase_scorer::PhraseScorer;
 pub use self::phrase_weight::PhraseWeight;
 
@@ -15,7 +14,7 @@ pub mod tests {
     use super::*;
     use crate::collector::tests::{TEST_COLLECTOR_WITHOUT_SCORE, TEST_COLLECTOR_WITH_SCORE};
     use crate::core::Index;
-    use crate::query::{EnableScoring, QueryParser, Weight};
+    use crate::query::{QueryParser, Weight};
     use crate::schema::{Schema, Term, TEXT};
     use crate::{assert_nearly_equals, DocAddress, DocId, TERMINATED};
 
@@ -75,13 +74,12 @@ pub mod tests {
         let index = create_index(&["a b b d c g c", "a b a b c"])?;
         let text_field = index.schema().get_field("text").unwrap();
         let searcher = index.reader()?.searcher();
-        let terms: Vec<Term> = ["a", "b", "c"]
+        let terms: Vec<Term> = vec!["a", "b", "c"]
             .iter()
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let phrase_query = PhraseQuery::new(terms);
-        let phrase_weight =
-            phrase_query.phrase_weight(EnableScoring::disabled_from_schema(searcher.schema()))?;
+        let phrase_weight = phrase_query.phrase_weight(&searcher, false)?;
         let mut phrase_scorer = phrase_weight.scorer(searcher.segment_reader(0), 1.0)?;
         assert_eq!(phrase_scorer.doc(), 1);
         assert_eq!(phrase_scorer.advance(), TERMINATED);
@@ -128,7 +126,9 @@ pub mod tests {
         let mut schema_builder = Schema::builder();
         use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
         let no_positions = TextOptions::default().set_indexing_options(
-            TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs),
+            TextFieldIndexing::default()
+                .set_tokenizer("default")
+                .set_index_option(IndexRecordOption::WithFreqs),
         );
 
         let text_field = schema_builder.add_text_field("text", no_positions);
@@ -160,7 +160,22 @@ pub mod tests {
     #[test]
     pub fn test_phrase_score() -> crate::Result<()> {
         let index = create_index(&["a b c", "a b c a b"])?;
-        let scores = test_query(0, &index, vec!["a", "b"]);
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader()?.searcher();
+        let test_query = |texts: Vec<&str>| {
+            let terms: Vec<Term> = texts
+                .iter()
+                .map(|text| Term::from_field_text(text_field, text))
+                .collect();
+            let phrase_query = PhraseQuery::new(terms);
+            searcher
+                .search(&phrase_query, &TEST_COLLECTOR_WITH_SCORE)
+                .expect("search should succeed")
+                .scores()
+                .to_vec()
+        };
+        let scores = test_query(vec!["a", "b"]);
         assert_nearly_equals!(scores[0], 0.40618482);
         assert_nearly_equals!(scores[1], 0.46844664);
         Ok(())
@@ -170,86 +185,50 @@ pub mod tests {
     #[test]
     pub fn test_phrase_score_with_slop() -> crate::Result<()> {
         let index = create_index(&["a c b", "a b c a b"])?;
-        let scores = test_query(1, &index, vec!["a", "b"]);
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let test_query = |texts: Vec<&str>| {
+            let terms: Vec<Term> = texts
+                .iter()
+                .map(|text| Term::from_field_text(text_field, text))
+                .collect();
+            let mut phrase_query = PhraseQuery::new(terms);
+            phrase_query.set_slop(1);
+            searcher
+                .search(&phrase_query, &TEST_COLLECTOR_WITH_SCORE)
+                .expect("search should succeed")
+                .scores()
+                .to_vec()
+        };
+        let scores = test_query(vec!["a", "b"]);
         assert_nearly_equals!(scores[0], 0.40618482);
         assert_nearly_equals!(scores[1], 0.46844664);
         Ok(())
     }
 
     #[test]
-    pub fn test_phrase_score_with_slop_bug() -> crate::Result<()> {
-        let index = create_index(&["asdf asdf Captain Subject Wendy", "Captain"])?;
-        let scores = test_query(1, &index, vec!["captain", "wendy"]);
-        assert_eq!(scores.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_phrase_score_with_slop_bug_2() -> crate::Result<()> {
-        // fails
-        let index = create_index(&["a x b x c", "a a c"])?;
-        let scores = test_query(2, &index, vec!["a", "b", "c"]);
-        assert_eq!(scores.len(), 1);
-
-        let index = create_index(&["a x b x c", "b c c"])?;
-        let scores = test_query(2, &index, vec!["a", "b", "c"]);
-        assert_eq!(scores.len(), 1);
-
-        Ok(())
-    }
-
-    fn test_query(slop: u32, index: &Index, texts: Vec<&str>) -> Vec<f32> {
-        let text_field = index.schema().get_field("text").unwrap();
-        let searcher = index.reader().unwrap().searcher();
-        let terms: Vec<Term> = texts
-            .iter()
-            .map(|text| Term::from_field_text(text_field, text))
-            .collect();
-        let mut phrase_query = PhraseQuery::new(terms);
-        phrase_query.set_slop(slop);
-        searcher
-            .search(&phrase_query, &TEST_COLLECTOR_WITH_SCORE)
-            .expect("search should succeed")
-            .scores()
-            .to_vec()
-    }
-
-    #[test]
-    pub fn test_phrase_score_with_slop_repeating() -> crate::Result<()> {
-        let index = create_index(&["wendy subject subject captain", "Captain"])?;
-        let scores = test_query(1, &index, vec!["wendy", "subject", "captain"]);
-        assert_eq!(scores.len(), 1);
-        Ok(())
-    }
-
-    #[test]
     pub fn test_phrase_score_with_slop_size() -> crate::Result<()> {
         let index = create_index(&["a b e c", "a e e e c", "a e e e e c"])?;
-        let scores = test_query(3, &index, vec!["a", "c"]);
-        assert_eq!(scores.len(), 2);
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let test_query = |texts: Vec<&str>| {
+            let terms: Vec<Term> = texts
+                .iter()
+                .map(|text| Term::from_field_text(text_field, text))
+                .collect();
+            let mut phrase_query = PhraseQuery::new(terms);
+            phrase_query.set_slop(3);
+            searcher
+                .search(&phrase_query, &TEST_COLLECTOR_WITH_SCORE)
+                .expect("search should succeed")
+                .scores()
+                .to_vec()
+        };
+        let scores = test_query(vec!["a", "c"]);
         assert_nearly_equals!(scores[0], 0.29086056);
         assert_nearly_equals!(scores[1], 0.26706287);
-        Ok(())
-    }
-
-    #[test]
-    pub fn test_phrase_slop() -> crate::Result<()> {
-        let index = create_index(&["a x b c"])?;
-        let scores = test_query(1, &index, vec!["a", "b", "c"]);
-        assert_eq!(scores.len(), 1);
-
-        let index = create_index(&["a x b x c"])?;
-        let scores = test_query(1, &index, vec!["a", "b", "c"]);
-        assert_eq!(scores.len(), 0);
-
-        let index = create_index(&["a b"])?;
-        let scores = test_query(1, &index, vec!["b", "a"]);
-        assert_eq!(scores.len(), 0);
-
-        let index = create_index(&["a b"])?;
-        let scores = test_query(2, &index, vec!["b", "a"]);
-        assert_eq!(scores.len(), 1);
-
         Ok(())
     }
 
@@ -258,16 +237,31 @@ pub mod tests {
         let index = create_index(&[
             "a e b e c",
             "a e e e e e b e e e e c",
-            "a c b", // also matches
+            "a c b",
             "a c e b e",
             "a e c b",
             "a e b c",
         ])?;
-        let scores = test_query(3, &index, vec!["a", "b", "c"]);
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let test_query = |texts: Vec<&str>| {
+            let terms: Vec<Term> = texts
+                .iter()
+                .map(|text| Term::from_field_text(text_field, text))
+                .collect();
+            let mut phrase_query = PhraseQuery::new(terms);
+            phrase_query.set_slop(3);
+            searcher
+                .search(&phrase_query, &TEST_COLLECTOR_WITH_SCORE)
+                .expect("search should succeed")
+                .scores()
+                .to_vec()
+        };
+        let scores = test_query(vec!["a", "b", "c"]);
         // The first and last matches.
         assert_nearly_equals!(scores[0], 0.23091172);
-        assert_nearly_equals!(scores[1], 0.27310878);
-        assert_nearly_equals!(scores[3], 0.25024384);
+        assert_nearly_equals!(scores[1], 0.25024384);
         Ok(())
     }
 
@@ -367,9 +361,7 @@ pub mod tests {
         let matching_docs = |query: &str| {
             let query_parser = QueryParser::for_index(&index, vec![json_field]);
             let phrase_query = query_parser.parse_query(query).unwrap();
-            let phrase_weight = phrase_query
-                .weight(EnableScoring::disabled_from_schema(searcher.schema()))
-                .unwrap();
+            let phrase_weight = phrase_query.weight(&*searcher, false).unwrap();
             let mut phrase_scorer = phrase_weight
                 .scorer(searcher.segment_reader(0), 1.0f32)
                 .unwrap();

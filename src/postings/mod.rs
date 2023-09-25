@@ -15,9 +15,8 @@ mod recorder;
 mod segment_postings;
 mod serializer;
 mod skip;
+mod stacker;
 mod term_info;
-
-pub(crate) use stacker::compute_table_memory_size;
 
 pub use self::block_segment_postings::BlockSegmentPostings;
 pub(crate) use self::indexing_context::IndexingContext;
@@ -27,9 +26,12 @@ pub(crate) use self::postings_writer::{serialize_postings, IndexingPosition, Pos
 pub use self::segment_postings::SegmentPostings;
 pub use self::serializer::{FieldSerializer, InvertedIndexSerializer};
 pub(crate) use self::skip::{BlockInfo, SkipReader};
+pub(crate) use self::stacker::compute_table_size;
 pub use self::term_info::TermInfo;
 
-#[allow(clippy::enum_variant_names)]
+pub(crate) type UnorderedTermId = u64;
+
+#[cfg_attr(feature = "cargo-clippy", allow(clippy::enum_variant_names))]
 #[derive(Debug, PartialEq, Clone, Copy, Eq)]
 pub(crate) enum FreqReadingOption {
     NoFreq,
@@ -162,7 +164,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         index
             .tokenizers()
-            .register("simple_no_truncation", SimpleTokenizer::default());
+            .register("simple_no_truncation", SimpleTokenizer);
         let reader = index.reader()?;
         let mut index_writer = index.writer_for_tests()?;
 
@@ -194,7 +196,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         index
             .tokenizers()
-            .register("simple_no_truncation", SimpleTokenizer::default());
+            .register("simple_no_truncation", SimpleTokenizer);
         let reader = index.reader()?;
         let mut index_writer = index.writer_for_tests()?;
 
@@ -220,12 +222,12 @@ pub mod tests {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
+        let index = Index::create_in_ram(schema.clone());
         let segment = index.new_segment();
 
         {
             let mut segment_writer =
-                SegmentWriter::for_segment(15_000_000, segment.clone()).unwrap();
+                SegmentWriter::for_segment(3_000_000, segment.clone(), schema).unwrap();
             {
                 // checking that position works if the field has two values
                 let op = AddOperation {
@@ -498,7 +500,7 @@ pub mod tests {
         Ok(())
     }
 
-    /// Wraps a given docset, and forward all call but the
+    /// Wraps a given docset, and forward alls call but the
     /// `.skip_next(...)`. This is useful to test that a specialized
     /// implementation of `.skip_next(...)` is consistent
     /// with the default implementation.
@@ -544,7 +546,8 @@ pub mod tests {
             let skip_result_unopt = postings_unopt.seek(target);
             assert_eq!(
                 skip_result_unopt, skip_result_opt,
-                "Failed while skipping to {target}"
+                "Failed while skipping to {}",
+                target
             );
             assert!(skip_result_opt >= target);
             assert_eq!(skip_result_opt, postings_opt.doc());
@@ -628,7 +631,7 @@ mod bench {
             let mut segment_postings = segment_reader
                 .inverted_index(TERM_A.field())
                 .unwrap()
-                .read_postings(&TERM_A, IndexRecordOption::Basic)
+                .read_postings(&*TERM_A, IndexRecordOption::Basic)
                 .unwrap()
                 .unwrap();
             while segment_postings.advance() != TERMINATED {}
@@ -644,25 +647,25 @@ mod bench {
             let segment_postings_a = segment_reader
                 .inverted_index(TERM_A.field())
                 .unwrap()
-                .read_postings(&TERM_A, IndexRecordOption::Basic)
+                .read_postings(&*TERM_A, IndexRecordOption::Basic)
                 .unwrap()
                 .unwrap();
             let segment_postings_b = segment_reader
                 .inverted_index(TERM_B.field())
                 .unwrap()
-                .read_postings(&TERM_B, IndexRecordOption::Basic)
+                .read_postings(&*TERM_B, IndexRecordOption::Basic)
                 .unwrap()
                 .unwrap();
             let segment_postings_c = segment_reader
                 .inverted_index(TERM_C.field())
                 .unwrap()
-                .read_postings(&TERM_C, IndexRecordOption::Basic)
+                .read_postings(&*TERM_C, IndexRecordOption::Basic)
                 .unwrap()
                 .unwrap();
             let segment_postings_d = segment_reader
                 .inverted_index(TERM_D.field())
                 .unwrap()
-                .read_postings(&TERM_D, IndexRecordOption::Basic)
+                .read_postings(&*TERM_D, IndexRecordOption::Basic)
                 .unwrap()
                 .unwrap();
             let mut intersection = Intersection::new(vec![
@@ -684,7 +687,7 @@ mod bench {
         let mut segment_postings = segment_reader
             .inverted_index(TERM_A.field())
             .unwrap()
-            .read_postings(&TERM_A, IndexRecordOption::Basic)
+            .read_postings(&*TERM_A, IndexRecordOption::Basic)
             .unwrap()
             .unwrap();
 
@@ -702,7 +705,7 @@ mod bench {
             let mut segment_postings = segment_reader
                 .inverted_index(TERM_A.field())
                 .unwrap()
-                .read_postings(&TERM_A, IndexRecordOption::Basic)
+                .read_postings(&*TERM_A, IndexRecordOption::Basic)
                 .unwrap()
                 .unwrap();
             for doc in &existing_docs {
@@ -743,7 +746,7 @@ mod bench {
             let mut segment_postings = segment_reader
                 .inverted_index(TERM_A.field())
                 .unwrap()
-                .read_postings(&TERM_A, IndexRecordOption::Basic)
+                .read_postings(&*TERM_A, IndexRecordOption::Basic)
                 .unwrap()
                 .unwrap();
             let mut s = 0u32;

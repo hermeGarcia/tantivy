@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::channel::oneshot;
+use futures::executor::block_on;
+
 use super::*;
 
 #[cfg(feature = "mmap")]
@@ -181,7 +184,7 @@ fn test_directory_delete(directory: &dyn Directory) -> crate::Result<()> {
 
 fn test_watch(directory: &dyn Directory) {
     let counter: Arc<AtomicUsize> = Default::default();
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = crossbeam::channel::unbounded();
     let timeout = Duration::from_millis(500);
 
     let handle = directory
@@ -246,8 +249,8 @@ fn test_lock_blocking(directory: &dyn Directory) {
     std::thread::spawn(move || {
         //< lock_a_res is sent to the thread.
         in_thread_clone.store(true, SeqCst);
-        let _just_sync = receiver.recv();
-        // explicitly dropping lock_a_res. It would have been sufficient to just force it
+        let _just_sync = block_on(receiver);
+        // explicitely droping lock_a_res. It would have been sufficient to just force it
         // to be part of the move, but the intent seems clearer that way.
         drop(lock_a_res);
     });
@@ -270,7 +273,7 @@ fn test_lock_blocking(directory: &dyn Directory) {
         assert!(in_thread.load(SeqCst));
         assert!(lock_a_res.is_ok());
     });
-    assert!(receiver2.recv().is_ok());
+    assert!(block_on(receiver2).is_ok());
     assert!(sender.send(()).is_ok());
     assert!(join_handle.join().is_ok());
 }

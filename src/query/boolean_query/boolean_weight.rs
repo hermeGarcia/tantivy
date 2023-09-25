@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 
 use crate::core::SegmentReader;
-use crate::docset::BUFFER_LEN;
 use crate::postings::FreqReadingOption;
 use crate::query::explanation::does_not_match;
-use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
+use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner, SumWithCoordsCombiner};
 use crate::query::term_query::TermScorer;
-use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
+use crate::query::weight::{for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
     intersect_scorers, EmptyScorer, Exclude, Explanation, Occur, RequiredOptionalScorer, Scorer,
     Union, Weight,
@@ -18,16 +17,11 @@ enum SpecializedScorer {
     Other(Box<dyn Scorer>),
 }
 
-fn scorer_union<TScoreCombiner>(
-    scorers: Vec<Box<dyn Scorer>>,
-    score_combiner_fn: impl Fn() -> TScoreCombiner,
-) -> SpecializedScorer
-where
-    TScoreCombiner: ScoreCombiner,
-{
+fn scorer_union<TScoreCombiner>(scorers: Vec<Box<dyn Scorer>>) -> SpecializedScorer
+where TScoreCombiner: ScoreCombiner {
     assert!(!scorers.is_empty());
     if scorers.len() == 1 {
-        return SpecializedScorer::Other(scorers.into_iter().next().unwrap()); //< we checked the size beforehand
+        return SpecializedScorer::Other(scorers.into_iter().next().unwrap()); //< we checked the size beforehands
     }
 
     {
@@ -44,47 +38,35 @@ where
                 // Block wand is only available if we read frequencies.
                 return SpecializedScorer::TermUnion(scorers);
             } else {
-                return SpecializedScorer::Other(Box::new(Union::build(
+                return SpecializedScorer::Other(Box::new(Union::<_, TScoreCombiner>::from(
                     scorers,
-                    score_combiner_fn,
                 )));
             }
         }
     }
-    SpecializedScorer::Other(Box::new(Union::build(scorers, score_combiner_fn)))
+    SpecializedScorer::Other(Box::new(Union::<_, TScoreCombiner>::from(scorers)))
 }
 
-fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
-    scorer: SpecializedScorer,
-    score_combiner_fn: impl Fn() -> TScoreCombiner,
-) -> Box<dyn Scorer> {
+fn into_box_scorer<TScoreCombiner: ScoreCombiner>(scorer: SpecializedScorer) -> Box<dyn Scorer> {
     match scorer {
         SpecializedScorer::TermUnion(term_scorers) => {
-            let union_scorer = Union::build(term_scorers, score_combiner_fn);
+            let union_scorer = Union::<TermScorer, TScoreCombiner>::from(term_scorers);
             Box::new(union_scorer)
         }
         SpecializedScorer::Other(scorer) => scorer,
     }
 }
 
-/// Weight associated to the `BoolQuery`.
-pub struct BooleanWeight<TScoreCombiner: ScoreCombiner> {
+pub struct BooleanWeight {
     weights: Vec<(Occur, Box<dyn Weight>)>,
     scoring_enabled: bool,
-    score_combiner_fn: Box<dyn Fn() -> TScoreCombiner + Sync + Send>,
 }
 
-impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
-    /// Creates a new boolean weight.
-    pub fn new(
-        weights: Vec<(Occur, Box<dyn Weight>)>,
-        scoring_enabled: bool,
-        score_combiner_fn: Box<dyn Fn() -> TScoreCombiner + Sync + Send + 'static>,
-    ) -> BooleanWeight<TScoreCombiner> {
+impl BooleanWeight {
+    pub fn new(weights: Vec<(Occur, Box<dyn Weight>)>, scoring_enabled: bool) -> BooleanWeight {
         BooleanWeight {
             weights,
             scoring_enabled,
-            score_combiner_fn,
         }
     }
 
@@ -94,33 +76,31 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         boost: Score,
     ) -> crate::Result<HashMap<Occur, Vec<Box<dyn Scorer>>>> {
         let mut per_occur_scorers: HashMap<Occur, Vec<Box<dyn Scorer>>> = HashMap::new();
-        for (occur, subweight) in &self.weights {
+        for &(ref occur, ref subweight) in &self.weights {
             let sub_scorer: Box<dyn Scorer> = subweight.scorer(reader, boost)?;
             per_occur_scorers
                 .entry(*occur)
-                .or_default()
+                .or_insert_with(Vec::new)
                 .push(sub_scorer);
         }
         Ok(per_occur_scorers)
     }
 
-    fn complex_scorer<TComplexScoreCombiner: ScoreCombiner>(
+    fn complex_scorer<TScoreCombiner: ScoreCombiner>(
         &self,
         reader: &SegmentReader,
         boost: Score,
-        score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
     ) -> crate::Result<SpecializedScorer> {
         let mut per_occur_scorers = self.per_occur_scorers(reader, boost)?;
 
         let should_scorer_opt: Option<SpecializedScorer> = per_occur_scorers
             .remove(&Occur::Should)
-            .map(|scorers| scorer_union(scorers, &score_combiner_fn));
+            .map(scorer_union::<TScoreCombiner>);
+
         let exclude_scorer_opt: Option<Box<dyn Scorer>> = per_occur_scorers
             .remove(&Occur::MustNot)
-            .map(|scorers| scorer_union(scorers, DoNothingCombiner::default))
-            .map(|specialized_scorer| {
-                into_box_scorer(specialized_scorer, DoNothingCombiner::default)
-            });
+            .map(scorer_union::<DoNothingCombiner>)
+            .map(into_box_scorer::<DoNothingCombiner>);
 
         let must_scorer_opt: Option<Box<dyn Scorer>> = per_occur_scorers
             .remove(&Occur::Must)
@@ -132,10 +112,10 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     SpecializedScorer::Other(Box::new(RequiredOptionalScorer::<
                         Box<dyn Scorer>,
                         Box<dyn Scorer>,
-                        TComplexScoreCombiner,
+                        TScoreCombiner,
                     >::new(
                         must_scorer,
-                        into_box_scorer(should_scorer, &score_combiner_fn),
+                        into_box_scorer::<TScoreCombiner>(should_scorer),
                     )))
                 } else {
                     SpecializedScorer::Other(must_scorer)
@@ -149,7 +129,8 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         };
 
         if let Some(exclude_scorer) = exclude_scorer_opt {
-            let positive_scorer_boxed = into_box_scorer(positive_scorer, &score_combiner_fn);
+            let positive_scorer_boxed: Box<dyn Scorer> =
+                into_box_scorer::<TScoreCombiner>(positive_scorer);
             Ok(SpecializedScorer::Other(Box::new(Exclude::new(
                 positive_scorer_boxed,
                 exclude_scorer,
@@ -160,7 +141,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
     }
 }
 
-impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombiner> {
+impl Weight for BooleanWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
         if self.weights.is_empty() {
             Ok(Box::new(EmptyScorer))
@@ -172,15 +153,13 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                 weight.scorer(reader, boost)
             }
         } else if self.scoring_enabled {
-            self.complex_scorer(reader, boost, &self.score_combiner_fn)
+            self.complex_scorer::<SumWithCoordsCombiner>(reader, boost)
                 .map(|specialized_scorer| {
-                    into_box_scorer(specialized_scorer, &self.score_combiner_fn)
+                    into_box_scorer::<SumWithCoordsCombiner>(specialized_scorer)
                 })
         } else {
-            self.complex_scorer(reader, boost, DoNothingCombiner::default)
-                .map(|specialized_scorer| {
-                    into_box_scorer(specialized_scorer, DoNothingCombiner::default)
-                })
+            self.complex_scorer::<DoNothingCombiner>(reader, boost)
+                .map(into_box_scorer::<DoNothingCombiner>)
         }
     }
 
@@ -193,8 +172,8 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             return Ok(Explanation::new("BooleanQuery with no scoring", 1.0));
         }
 
-        let mut explanation = Explanation::new("BooleanClause. sum of ...", scorer.score());
-        for (occur, subweight) in &self.weights {
+        let mut explanation = Explanation::new("BooleanClause. Sum of ...", scorer.score());
+        for &(ref occur, ref subweight) in &self.weights {
             if is_positive_occur(*occur) {
                 if let Ok(child_explanation) = subweight.explain(reader, doc) {
                     explanation.add_detail(child_explanation);
@@ -209,34 +188,15 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score),
     ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
+        let scorer = self.complex_scorer::<SumWithCoordsCombiner>(reader, 1.0)?;
         match scorer {
             SpecializedScorer::TermUnion(term_scorers) => {
-                let mut union_scorer = Union::build(term_scorers, &self.score_combiner_fn);
+                let mut union_scorer =
+                    Union::<TermScorer, SumWithCoordsCombiner>::from(term_scorers);
                 for_each_scorer(&mut union_scorer, callback);
             }
             SpecializedScorer::Other(mut scorer) => {
                 for_each_scorer(scorer.as_mut(), callback);
-            }
-        }
-        Ok(())
-    }
-
-    fn for_each_no_score(
-        &self,
-        reader: &SegmentReader,
-        callback: &mut dyn FnMut(&[DocId]),
-    ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, || DoNothingCombiner)?;
-        let mut buffer = [0u32; BUFFER_LEN];
-
-        match scorer {
-            SpecializedScorer::TermUnion(term_scorers) => {
-                let mut union_scorer = Union::build(term_scorers, &self.score_combiner_fn);
-                for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
-            }
-            SpecializedScorer::Other(mut scorer) => {
-                for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
             }
         }
         Ok(())
@@ -258,7 +218,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         reader: &SegmentReader,
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
-        let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
+        let scorer = self.complex_scorer::<SumWithCoordsCombiner>(reader, 1.0)?;
         match scorer {
             SpecializedScorer::TermUnion(term_scorers) => {
                 super::block_wand(term_scorers, threshold, callback);

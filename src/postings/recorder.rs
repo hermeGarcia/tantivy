@@ -1,6 +1,6 @@
 use common::read_u32_vint;
-use stacker::{ExpUnrolledLinkedList, MemoryArena};
 
+use super::stacker::{ExpUnrolledLinkedList, MemoryArena};
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::postings::FieldSerializer;
 use crate::DocId;
@@ -47,16 +47,16 @@ impl<'a> Iterator for VInt32Reader<'a> {
     }
 }
 
-/// `Recorder` is in charge of recording relevant information about
+/// Recorder is in charge of recording relevant information about
 /// the presence of a term in a document.
 ///
-/// Depending on the [`TextOptions`](crate::schema::TextOptions) associated
-/// with the field, the recorder may record:
+/// Depending on the `TextIndexingOptions` associated to the
+/// field, the recorder may records
 ///   * the document frequency
 ///   * the document id
 ///   * the term frequency
 ///   * the term positions
-pub(crate) trait Recorder: Copy + Default + Send + Sync + 'static {
+pub(crate) trait Recorder: Copy + Default + 'static {
     /// Returns the current document
     fn current_doc(&self) -> u32;
     /// Starts recording information about a new document
@@ -83,36 +83,32 @@ pub(crate) trait Recorder: Copy + Default + Send + Sync + 'static {
 
 /// Only records the doc ids
 #[derive(Clone, Copy)]
-pub struct DocIdRecorder {
+pub struct NothingRecorder {
     stack: ExpUnrolledLinkedList,
     current_doc: DocId,
 }
 
-impl Default for DocIdRecorder {
+impl Default for NothingRecorder {
     fn default() -> Self {
-        DocIdRecorder {
-            stack: ExpUnrolledLinkedList::default(),
-            current_doc: u32::MAX,
+        NothingRecorder {
+            stack: ExpUnrolledLinkedList::new(),
+            current_doc: u32::max_value(),
         }
     }
 }
 
-impl Recorder for DocIdRecorder {
-    #[inline]
+impl Recorder for NothingRecorder {
     fn current_doc(&self) -> DocId {
         self.current_doc
     }
 
-    #[inline]
     fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena) {
         self.current_doc = doc;
         self.stack.writer(arena).write_u32_vint(doc);
     }
 
-    #[inline]
     fn record_position(&mut self, _position: u32, _arena: &mut MemoryArena) {}
 
-    #[inline]
     fn close_doc(&mut self, _arena: &mut MemoryArena) {}
 
     fn serialize(
@@ -148,7 +144,7 @@ impl Recorder for DocIdRecorder {
 }
 
 /// Recorder encoding document ids, and term frequencies
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct TermFrequencyRecorder {
     stack: ExpUnrolledLinkedList,
     current_doc: DocId,
@@ -156,25 +152,32 @@ pub struct TermFrequencyRecorder {
     term_doc_freq: u32,
 }
 
+impl Default for TermFrequencyRecorder {
+    fn default() -> Self {
+        TermFrequencyRecorder {
+            stack: ExpUnrolledLinkedList::new(),
+            current_doc: 0,
+            current_tf: 0u32,
+            term_doc_freq: 0u32,
+        }
+    }
+}
+
 impl Recorder for TermFrequencyRecorder {
-    #[inline]
     fn current_doc(&self) -> DocId {
         self.current_doc
     }
 
-    #[inline]
     fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena) {
         self.term_doc_freq += 1;
         self.current_doc = doc;
         self.stack.writer(arena).write_u32_vint(doc);
     }
 
-    #[inline]
     fn record_position(&mut self, _position: u32, _arena: &mut MemoryArena) {
         self.current_tf += 1;
     }
 
-    #[inline]
     fn close_doc(&mut self, arena: &mut MemoryArena) {
         debug_assert!(self.current_tf > 0);
         self.stack.writer(arena).write_u32_vint(self.current_tf);
@@ -226,34 +229,30 @@ pub struct TfAndPositionRecorder {
 impl Default for TfAndPositionRecorder {
     fn default() -> Self {
         TfAndPositionRecorder {
-            stack: ExpUnrolledLinkedList::default(),
-            current_doc: u32::MAX,
+            stack: ExpUnrolledLinkedList::new(),
+            current_doc: u32::max_value(),
             term_doc_freq: 0u32,
         }
     }
 }
 
 impl Recorder for TfAndPositionRecorder {
-    #[inline]
     fn current_doc(&self) -> DocId {
         self.current_doc
     }
 
-    #[inline]
     fn new_doc(&mut self, doc: DocId, arena: &mut MemoryArena) {
         self.current_doc = doc;
         self.term_doc_freq += 1u32;
         self.stack.writer(arena).write_u32_vint(doc);
     }
 
-    #[inline]
     fn record_position(&mut self, position: u32, arena: &mut MemoryArena) {
         self.stack
             .writer(arena)
             .write_u32_vint(position.wrapping_add(1u32));
     }
 
-    #[inline]
     fn close_doc(&mut self, arena: &mut MemoryArena) {
         self.stack.writer(arena).write_u32_vint(POSITION_END);
     }
@@ -340,7 +339,7 @@ mod tests {
     #[test]
     fn test_vint_u32() {
         let mut buffer = vec![];
-        let vals = [0, 1, 324_234_234, u32::MAX];
+        let vals = [0, 1, 324_234_234, u32::max_value()];
         for &i in &vals {
             assert!(write_u32_vint(i, &mut buffer).is_ok());
         }
