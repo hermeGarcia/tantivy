@@ -568,7 +568,51 @@ impl SegmentUpdater {
             ))
         }))
     }
+    pub fn force_merge(&self, merge_operation: MergeOperation) -> crate::Result<SegmentMeta> {
+        let segment_entries: Vec<SegmentEntry> = self
+            .segment_manager
+            .start_merge(merge_operation.segment_ids())?;
+        info!("Starting merge  - {:?}", merge_operation.segment_ids());
+        let mut after_merge_segment_entry = merge(
+            &self.index,
+            segment_entries,
+            merge_operation.target_opstamp(),
+        )?;
+        let after_merge_segment_meta = after_merge_segment_entry.meta().clone();
+        // After merge logic
+        let mut delete_cursor = after_merge_segment_entry.delete_cursor().clone();
+        if let Some(delete_operation) = delete_cursor.get() {
+            let committed_opstamp = self.load_meta().opstamp;
+            if delete_operation.opstamp < committed_opstamp {
+                let index = &self.index;
+                let segment = index.segment(after_merge_segment_entry.meta().clone());
+                if let Err(advance_deletes_err) =
+                    advance_deletes(segment, &mut after_merge_segment_entry, committed_opstamp)
+                {
+                    error!(
+                        "Merge of {:?} was cancelled (advancing deletes failed): {:?}",
+                        merge_operation.segment_ids(),
+                        advance_deletes_err
+                    );
+                    assert!(!cfg!(test), "Merge failed.");
 
+                    // ... cancel merge
+                    // `merge_operations` are tracked. As it is dropped, the
+                    // the segment_ids will be available again for merge.
+                    return Err(advance_deletes_err);
+                }
+            }
+        }
+        let previous_metas = self.load_meta();
+        let segments_status = self
+            .segment_manager
+            .end_merge(merge_operation.segment_ids(), after_merge_segment_entry)?;
+
+        if segments_status == SegmentsStatus::Committed {
+            self.save_metas(previous_metas.opstamp, previous_metas.payload.clone())?;
+        }
+        Ok(after_merge_segment_meta)
+    }
     pub(crate) fn get_mergeable_segments(&self) -> (Vec<SegmentMeta>, Vec<SegmentMeta>) {
         let merge_segment_ids: HashSet<SegmentId> = self.merge_operations.segment_in_merge();
         self.segment_manager

@@ -525,6 +525,17 @@ impl IndexWriter {
         async move { segment_updater.start_merge(merge_operation)?.await }
     }
 
+    /// Merges a given list of segments bypassing the future thread pool.
+    /// This function is needed for use cases where the index has an async executor on top.
+    /// `segment_ids` is required to be non-empty.
+    pub fn sync_merge(&mut self, segment_ids: &[SegmentId]) -> crate::Result<()> {
+        if !segment_ids.is_empty() {
+            let merge_operation = self.segment_updater.make_merge_operation(segment_ids);
+            self.segment_updater.force_merge(merge_operation)?;
+        }
+        Ok(())
+    }
+
     /// Closes the current document channel send.
     /// and replace all the channels by new ones.
     ///
@@ -1015,6 +1026,42 @@ mod tests {
         }
         reader.reload()?;
         reader.searcher();
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_merge() -> crate::Result<()> {
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", schema::TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let num_docs_containing = |s: &str| {
+            let term_a = Term::from_field_text(text_field, s);
+            reader.searcher().doc_freq(&term_a).unwrap()
+        };
+        // writing the segment
+        let mut index_writer = index.writer(12_000_000).unwrap();
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+        for _doc in 0..100 {
+            index_writer.add_document(doc!(text_field=>"a"))?;
+        }
+        index_writer.commit()?;
+
+        // There is more than 1 segment
+        let before_merge = index.searchable_segment_ids().unwrap();
+        assert!(before_merge.len() > 1);
+
+        // Force merging currently available segments
+        index_writer.sync_merge(&before_merge).unwrap();
+        reader.reload()?;
+
+        // The resulting index has the same data in only one segment.
+        assert_eq!(num_docs_containing("a"), 100);
+        let after_merge = index.searchable_segment_ids().unwrap();
+        assert_eq!(after_merge.len(), 1);
         Ok(())
     }
 
