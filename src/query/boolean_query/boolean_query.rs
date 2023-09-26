@@ -204,8 +204,8 @@ impl BooleanQuery {
 #[cfg(test)]
 mod tests {
     use super::BooleanQuery;
-    use crate::collector::{Count, DocSetCollector};
-    use crate::query::{QueryClone, QueryParser, TermQuery};
+    use crate::collector::DocSetCollector;
+    use crate::query::{QueryClone, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, TEXT};
     use crate::{DocAddress, Index, Term};
 

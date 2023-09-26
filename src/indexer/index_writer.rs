@@ -1,11 +1,9 @@
 use std::ops::Range;
-use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 
 use common::BitSet;
 use crossbeam::channel;
-use futures::executor::block_on;
 use smallvec::smallvec;
 
 use super::operation::{AddOperation, UserOperation};
@@ -21,7 +19,7 @@ use crate::indexer::doc_opstamp_mapping::DocToOpstampMapping;
 use crate::indexer::index_writer_status::IndexWriterStatus;
 use crate::indexer::operation::DeleteOperation;
 use crate::indexer::stamper::Stamper;
-use crate::indexer::{MergePolicy, SegmentEntry, SegmentWriter};
+use crate::indexer::{SegmentEntry, SegmentWriter};
 use crate::schema::{Document, IndexRecordOption, Term};
 use crate::Opstamp;
 
@@ -213,7 +211,7 @@ fn index_documents(
     meta.untrack_temp_docstore();
     // update segment_updater inventory to remove tempstore
     let segment_entry = SegmentEntry::new(meta, delete_cursor, alive_bitset_opt);
-    block_on(segment_updater.schedule_add_segment(segment_entry))?;
+    segment_updater.add_segment(segment_entry)?;
     Ok(())
 }
 
@@ -339,7 +337,7 @@ impl IndexWriter {
     pub fn add_segment(&self, segment_meta: SegmentMeta) -> crate::Result<()> {
         let delete_cursor = self.delete_queue.cursor();
         let segment_entry = SegmentEntry::new(segment_meta, delete_cursor, None);
-        block_on(self.segment_updater.schedule_add_segment(segment_entry))
+        self.segment_updater.add_segment(segment_entry)
     }
 
     /// Creates a new segment.
@@ -418,16 +416,6 @@ impl IndexWriter {
         Ok(())
     }
 
-    /// Accessor to the merge policy.
-    pub fn get_merge_policy(&self) -> Arc<dyn MergePolicy> {
-        self.segment_updater.get_merge_policy()
-    }
-
-    /// Setter for the merge policy.
-    pub fn set_merge_policy(&self, merge_policy: Box<dyn MergePolicy>) {
-        self.segment_updater.set_merge_policy(merge_policy);
-    }
-
     fn start_workers(&mut self) -> crate::Result<()> {
         for _ in 0..self.num_threads {
             self.add_indexing_worker()?;
@@ -437,7 +425,7 @@ impl IndexWriter {
 
     /// Detects and removes the files that are not used by the index anymore.
     pub async fn garbage_collect_files(&self) -> crate::Result<GarbageCollectionResult> {
-        self.segment_updater.schedule_garbage_collect().await
+        self.segment_updater.garbage_collect().await
     }
 
     /// Deletes all documents from the index
@@ -747,32 +735,15 @@ impl Drop for IndexWriter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
-
-    use proptest::prelude::*;
-    use proptest::prop_oneof;
-    use proptest::strategy::Strategy;
 
     use super::super::operation::UserOperation;
     use crate::collector::TopDocs;
     use crate::directory::error::LockError;
     use crate::error::*;
     use crate::fastfield::FastFieldReader;
-    use crate::indexer::NoMergePolicy;
-    use crate::query::{QueryParser, TermQuery};
-    use crate::schema::{
-        self, Cardinality, Facet, FacetOptions, IndexRecordOption, NumericOptions,
-        TextFieldIndexing, TextOptions, FAST, INDEXED, STORED, STRING, TEXT,
-    };
-    use crate::{DocAddress, Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Term};
-
-    const LOREM: &str = "Doc Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
-                         eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad \
-                         minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip \
-                         ex ea commodo consequat. Duis aute irure dolor in reprehenderit in \
-                         voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur \
-                         sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt \
-                         mollit anim id est laborum.";
+    use crate::query::TermQuery;
+    use crate::schema::{self, IndexRecordOption, FAST, INDEXED, STRING};
+    use crate::{Index, IndexSettings, IndexSortByField, Order, ReloadPolicy, Term};
 
     #[test]
     fn test_operations_group() {
@@ -921,24 +892,6 @@ mod tests {
     }
 
     #[test]
-    fn test_set_merge_policy() {
-        let schema_builder = schema::Schema::builder();
-        let index = Index::create_in_ram(schema_builder.build());
-        let index_writer = index.writer(3_000_000).unwrap();
-        assert_eq!(
-            format!("{:?}", index_writer.get_merge_policy()),
-            "LogMergePolicy { min_num_segments: 8, max_docs_before_merge: 10000000, \
-             min_layer_size: 10000, level_log_size: 0.75, del_docs_ratio_before_merge: 1.0 }"
-        );
-        let merge_policy = Box::new(NoMergePolicy::default());
-        index_writer.set_merge_policy(merge_policy);
-        assert_eq!(
-            format!("{:?}", index_writer.get_merge_policy()),
-            "NoMergePolicy"
-        );
-    }
-
-    #[test]
     fn test_lockfile_released_on_drop() {
         let schema_builder = schema::Schema::builder();
         let index = Index::create_in_ram(schema_builder.build());
@@ -1000,7 +953,6 @@ mod tests {
         };
         // writing the segment
         let mut index_writer = index.writer(12_000_000).unwrap();
-        index_writer.set_merge_policy(Box::new(NoMergePolicy));
         for _doc in 0..100 {
             index_writer.add_document(doc!(text_field=>"a"))?;
         }
@@ -1337,270 +1289,6 @@ mod tests {
             .map(|doc| fast_field_reader.get(doc))
             .collect();
         assert_eq!(&in_order_alive_ids[..], &[9, 8, 7, 6, 5, 4, 1, 0]);
-        Ok(())
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    enum IndexingOp {
-        AddDoc { id: u64 },
-        DeleteDoc { id: u64 },
-        Commit,
-        Merge,
-    }
-
-    fn balanced_operation_strategy() -> impl Strategy<Value = IndexingOp> {
-        prop_oneof![
-            (0u64..20u64).prop_map(|id| IndexingOp::DeleteDoc { id }),
-            (0u64..20u64).prop_map(|id| IndexingOp::AddDoc { id }),
-            (0u64..1u64).prop_map(|_| IndexingOp::Commit),
-            (0u64..1u64).prop_map(|_| IndexingOp::Merge),
-        ]
-    }
-
-    fn adding_operation_strategy() -> impl Strategy<Value = IndexingOp> {
-        prop_oneof![
-            10 => (0u64..100u64).prop_map(|id| IndexingOp::DeleteDoc { id }),
-            50 => (0u64..100u64).prop_map(|id| IndexingOp::AddDoc { id }),
-            2 => (0u64..1u64).prop_map(|_| IndexingOp::Commit),
-            1 => (0u64..1u64).prop_map(|_| IndexingOp::Merge),
-        ]
-    }
-
-    fn expected_ids(ops: &[IndexingOp]) -> (HashMap<u64, u64>, HashSet<u64>) {
-        let mut existing_ids = HashMap::new();
-        let mut deleted_ids = HashSet::new();
-        for &op in ops {
-            match op {
-                IndexingOp::AddDoc { id } => {
-                    *existing_ids.entry(id).or_insert(0) += 1;
-                    deleted_ids.remove(&id);
-                }
-                IndexingOp::DeleteDoc { id } => {
-                    existing_ids.remove(&id);
-                    deleted_ids.insert(id);
-                }
-                _ => {}
-            }
-        }
-        (existing_ids, deleted_ids)
-    }
-
-    fn test_operation_strategy(
-        ops: &[IndexingOp],
-        sort_index: bool,
-        force_end_merge: bool,
-    ) -> crate::Result<()> {
-        let mut schema_builder = schema::Schema::builder();
-        let id_field = schema_builder.add_u64_field("id", FAST | INDEXED | STORED);
-        let bytes_field = schema_builder.add_bytes_field("bytes", FAST | INDEXED | STORED);
-        let text_field = schema_builder.add_text_field(
-            "text_field",
-            TextOptions::default()
-                .set_indexing_options(
-                    TextFieldIndexing::default()
-                        .set_index_option(schema::IndexRecordOption::WithFreqsAndPositions),
-                )
-                .set_stored(),
-        );
-
-        let large_text_field = schema_builder.add_text_field("large_text_field", TEXT | STORED);
-
-        let multi_numbers = schema_builder.add_u64_field(
-            "multi_numbers",
-            NumericOptions::default()
-                .set_fast(Cardinality::MultiValues)
-                .set_stored(),
-        );
-        let facet_field = schema_builder.add_facet_field("facet", FacetOptions::default());
-        let schema = schema_builder.build();
-        let settings = if sort_index {
-            IndexSettings {
-                sort_by_field: Some(IndexSortByField {
-                    field: "id".to_string(),
-                    order: Order::Asc,
-                }),
-                ..Default::default()
-            }
-        } else {
-            IndexSettings {
-                ..Default::default()
-            }
-        };
-        let index = Index::builder()
-            .schema(schema)
-            .settings(settings)
-            .create_in_ram()?;
-        let mut index_writer = index.writer_for_tests()?;
-        index_writer.set_merge_policy(Box::new(NoMergePolicy));
-
-        let old_reader = index.reader()?;
-
-        for &op in ops {
-            match op {
-                IndexingOp::AddDoc { id } => {
-                    let facet = Facet::from(&("/cola/".to_string() + &id.to_string()));
-                    index_writer.add_document(doc!(id_field=>id,
-                            bytes_field => id.to_le_bytes().as_slice(),
-                            multi_numbers=> id,
-                            multi_numbers => id,
-                            text_field => id.to_string(),
-                            facet_field => facet,
-                            large_text_field=> LOREM
-                    ))?;
-                }
-                IndexingOp::DeleteDoc { id } => {
-                    index_writer.delete_term(Term::from_field_u64(id_field, id));
-                }
-                IndexingOp::Commit => {
-                    index_writer.commit()?;
-                }
-                IndexingOp::Merge => {
-                    let segment_ids = index
-                        .searchable_segment_ids()
-                        .expect("Searchable segments failed.");
-                    if segment_ids.len() >= 2 {
-                        index_writer.merge(&segment_ids).unwrap();
-                    }
-                }
-            }
-        }
-        index_writer.commit()?;
-
-        let searcher = index.reader()?.searcher();
-        if force_end_merge {
-            let mut index_writer = index.writer_for_tests()?;
-            let segment_ids = index
-                .searchable_segment_ids()
-                .expect("Searchable segments failed.");
-            if segment_ids.len() >= 2 {
-                index_writer.merge(&segment_ids).unwrap();
-            }
-        }
-
-        old_reader.reload()?;
-        let old_searcher = old_reader.searcher();
-
-        let ids_old_searcher: HashSet<u64> = old_searcher
-            .segment_readers()
-            .iter()
-            .flat_map(|segment_reader| {
-                let ff_reader = segment_reader.fast_fields().u64(id_field).unwrap();
-                segment_reader
-                    .doc_ids_alive()
-                    .map(move |doc| ff_reader.get(doc))
-            })
-            .collect();
-
-        let ids: HashSet<u64> = searcher
-            .segment_readers()
-            .iter()
-            .flat_map(|segment_reader| {
-                let ff_reader = segment_reader.fast_fields().u64(id_field).unwrap();
-                segment_reader
-                    .doc_ids_alive()
-                    .map(move |doc| ff_reader.get(doc))
-            })
-            .collect();
-
-        let (expected_ids_and_num_occurences, deleted_ids) = expected_ids(ops);
-        let num_docs_expected = expected_ids_and_num_occurences
-            .iter()
-            .map(|(_, id_occurences)| *id_occurences as usize)
-            .sum::<usize>();
-        assert_eq!(searcher.num_docs() as usize, num_docs_expected);
-        assert_eq!(old_searcher.num_docs() as usize, num_docs_expected);
-        assert_eq!(
-            ids_old_searcher,
-            expected_ids_and_num_occurences
-                .keys()
-                .cloned()
-                .collect::<HashSet<_>>()
-        );
-        assert_eq!(
-            ids,
-            expected_ids_and_num_occurences
-                .keys()
-                .cloned()
-                .collect::<HashSet<_>>()
-        );
-
-        // multivalue fast field tests
-        for segment_reader in searcher.segment_readers().iter() {
-            let ff_reader = segment_reader.fast_fields().u64s(multi_numbers).unwrap();
-            for doc in segment_reader.doc_ids_alive() {
-                let mut vals = vec![];
-                ff_reader.get_vals(doc, &mut vals);
-                assert_eq!(vals.len(), 2);
-                assert_eq!(vals[0], vals[1]);
-                assert!(expected_ids_and_num_occurences.contains_key(&vals[0]));
-            }
-        }
-
-        // doc store tests
-        for segment_reader in searcher.segment_readers().iter() {
-            let store_reader = segment_reader.get_store_reader().unwrap();
-            // test store iterator
-            for doc in store_reader.iter(segment_reader.alive_bitset()) {
-                let id = doc.unwrap().get_first(id_field).unwrap().as_u64().unwrap();
-                assert!(expected_ids_and_num_occurences.contains_key(&id));
-            }
-            // test store random access
-            for doc_id in segment_reader.doc_ids_alive() {
-                let id = store_reader
-                    .get(doc_id)
-                    .unwrap()
-                    .get_first(id_field)
-                    .unwrap()
-                    .as_u64()
-                    .unwrap();
-                assert!(expected_ids_and_num_occurences.contains_key(&id));
-                let id2 = store_reader
-                    .get(doc_id)
-                    .unwrap()
-                    .get_first(multi_numbers)
-                    .unwrap()
-                    .as_u64()
-                    .unwrap();
-                assert_eq!(id, id2);
-            }
-        }
-        // test search
-        let my_text_field = index.schema().get_field("text_field").unwrap();
-
-        let do_search = |term: &str| {
-            let query = QueryParser::for_index(&index, vec![my_text_field])
-                .parse_query(term)
-                .unwrap();
-            let top_docs: Vec<(f32, DocAddress)> =
-                searcher.search(&query, &TopDocs::with_limit(1000)).unwrap();
-
-            top_docs.iter().map(|el| el.1).collect::<Vec<_>>()
-        };
-
-        for (existing_id, count) in expected_ids_and_num_occurences {
-            assert_eq!(do_search(&existing_id.to_string()).len() as u64, count);
-        }
-        for existing_id in deleted_ids {
-            assert_eq!(do_search(&existing_id.to_string()).len(), 0);
-        }
-        // test facets
-        for segment_reader in searcher.segment_readers().iter() {
-            let mut facet_reader = segment_reader.facet_reader(facet_field).unwrap();
-            let ff_reader = segment_reader.fast_fields().u64(id_field).unwrap();
-            for doc_id in segment_reader.doc_ids_alive() {
-                let mut facet_ords = Vec::new();
-                facet_reader.facet_ords(doc_id, &mut facet_ords);
-                assert_eq!(facet_ords.len(), 1);
-                let mut facet = Facet::default();
-                facet_reader
-                    .facet_from_ord(facet_ords[0], &mut facet)
-                    .unwrap();
-                let id = ff_reader.get(doc_id);
-                let facet_expected = Facet::from(&("/cola/".to_string() + &id.to_string()));
-
-                assert_eq!(facet, facet_expected);
-            }
-        }
         Ok(())
     }
 

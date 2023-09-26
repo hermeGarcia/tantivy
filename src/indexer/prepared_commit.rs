@@ -49,7 +49,7 @@ impl<'a> PreparedCommit<'a> {
         info!("committing {}", self.opstamp);
         self.index_writer
             .segment_updater()
-            .schedule_commit(self.opstamp, self.payload)
+            .commit(self.opstamp, self.payload)
             .await?;
         Ok(self.opstamp)
     }

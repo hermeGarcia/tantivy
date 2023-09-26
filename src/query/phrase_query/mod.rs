@@ -9,12 +9,10 @@ pub use self::phrase_weight::PhraseWeight;
 #[cfg(test)]
 pub mod tests {
 
-    use serde_json::json;
-
     use super::*;
     use crate::collector::tests::{TEST_COLLECTOR_WITHOUT_SCORE, TEST_COLLECTOR_WITH_SCORE};
     use crate::core::Index;
-    use crate::query::{QueryParser, Weight};
+    use crate::query::Weight;
     use crate::schema::{Schema, Term, TEXT};
     use crate::{assert_nearly_equals, DocAddress, DocId, TERMINATED};
 

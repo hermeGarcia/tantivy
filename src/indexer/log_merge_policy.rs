@@ -162,13 +162,7 @@ mod tests {
         let index = Index::create_in_ram(schema);
 
         {
-            let mut log_merge_policy = LogMergePolicy::default();
-            log_merge_policy.set_min_num_segments(1);
-            log_merge_policy.set_max_docs_before_merge(1);
-            log_merge_policy.set_min_layer_size(0);
-
             let mut index_writer = index.writer_for_tests()?;
-            index_writer.set_merge_policy(Box::new(log_merge_policy));
 
             // after every commit the merge checker is started, it will merge only segments with 1
             // element in it because of the max_merge_size.

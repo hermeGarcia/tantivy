@@ -45,7 +45,6 @@ mod tests {
 
     use super::{SkipIndex, SkipIndexBuilder};
     use crate::directory::OwnedBytes;
-    use crate::indexer::NoMergePolicy;
     use crate::schema::{SchemaBuilder, STORED, TEXT};
     use crate::store::index::Checkpoint;
     use crate::{DocAddress, DocId, Index, Term};
@@ -130,7 +129,6 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer_for_tests()?;
-        index_writer.set_merge_policy(Box::new(NoMergePolicy));
         let long_text: String = "abcdefghijklmnopqrstuvwxyz".repeat(1_000);
         for _ in 0..20 {
             index_writer.add_document(doc!(body=>long_text.clone()))?;

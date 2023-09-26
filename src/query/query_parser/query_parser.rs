@@ -1010,20 +1010,6 @@ mod test {
         assert!(matches!(error, QueryParserError::FieldNotIndexed(_)));
     }
 
-    fn test_query_to_logical_ast_with_default_json(
-        query: &str,
-        expected: &str,
-        default_conjunction: bool,
-    ) {
-        let mut query_parser = make_query_parser_with_default_fields(&["json"]);
-        if default_conjunction {
-            query_parser.set_conjunction_by_default();
-        }
-        let ast = query_parser.parse_query_to_logical_ast(query).unwrap();
-        let ast_str = format!("{ast:?}");
-        assert_eq!(ast_str, expected);
-    }
-
     #[test]
     fn test_parse_bytes_phrase() {
         test_parse_query_to_logical_ast_helper(

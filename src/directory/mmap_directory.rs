@@ -474,7 +474,6 @@ mod tests {
     use common::HasLen;
 
     use super::*;
-    use crate::indexer::LogMergePolicy;
     use crate::schema::{Schema, SchemaBuilder, TEXT};
     use crate::{Index, IndexSettings, ReloadPolicy};
 
@@ -577,9 +576,6 @@ mod tests {
                 Index::create(mmap_directory.clone(), schema, IndexSettings::default()).unwrap();
 
             let mut index_writer = index.writer_for_tests()?;
-            let mut log_merge_policy = LogMergePolicy::default();
-            log_merge_policy.set_min_num_segments(3);
-            index_writer.set_merge_policy(Box::new(log_merge_policy));
             for _num_commits in 0..10 {
                 for _ in 0..10 {
                     index_writer.add_document(doc!(text_field=>"abc"))?;

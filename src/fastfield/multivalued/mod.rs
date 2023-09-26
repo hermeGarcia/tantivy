@@ -13,7 +13,6 @@ mod tests {
     use test_log::test;
 
     use crate::collector::TopDocs;
-    use crate::indexer::NoMergePolicy;
     use crate::query::QueryParser;
     use crate::schema::{Cardinality, Facet, FacetOptions, NumericOptions, Schema};
     use crate::{Document, Index, Term};
@@ -235,7 +234,6 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer_for_tests()?;
-        index_writer.set_merge_policy(Box::new(NoMergePolicy));
 
         for &op in ops {
             match op {

@@ -2004,11 +2004,6 @@ mod tests {
 
         let mut writer = index.writer_for_tests()?;
 
-        // Make sure we'll attempt to merge every created segment
-        let mut policy = crate::indexer::LogMergePolicy::default();
-        policy.set_min_num_segments(2);
-        writer.set_merge_policy(Box::new(policy));
-
         for i in 0..100 {
             let mut doc = Document::new();
             doc.add_f64(field, 42.0);

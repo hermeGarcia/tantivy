@@ -127,7 +127,6 @@ impl Scorer for TermScorer {
 mod tests {
     use proptest::prelude::*;
 
-    use crate::merge_policy::NoMergePolicy;
     use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
     use crate::query::term_query::TermScorer;
     use crate::query::{Bm25Weight, Scorer, TermQuery};
@@ -297,7 +296,6 @@ mod tests {
         let mut writer = index.writer_with_num_threads(3, 30_000_000)?;
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        writer.set_merge_policy(Box::new(NoMergePolicy));
         for _ in 0..3_000 {
             let term_freq = rng.gen_range(1..10000);
             let words: Vec<&str> = std::iter::repeat("bbbb").take(term_freq).collect();

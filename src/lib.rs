@@ -936,7 +936,6 @@ pub mod tests {
     #[test]
     fn test_update_via_delete_insert() -> crate::Result<()> {
         use crate::collector::Count;
-        use crate::indexer::NoMergePolicy;
         use crate::query::AllQuery;
         use crate::SegmentId;
 
@@ -950,7 +949,6 @@ pub mod tests {
         let index_reader = index.reader()?;
 
         let mut index_writer = index.writer_for_tests()?;
-        index_writer.set_merge_policy(Box::new(NoMergePolicy));
 
         for doc_id in 0u64..DOC_COUNT {
             index_writer.add_document(doc!(id => doc_id))?;

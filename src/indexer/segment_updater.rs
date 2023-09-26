@@ -8,9 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use fail::fail_point;
-use futures::channel::oneshot;
-use futures::executor::{ThreadPool, ThreadPoolBuilder};
-use futures::future::Future;
 
 use super::segment_manager::SegmentManager;
 use crate::core::{
@@ -22,9 +19,7 @@ use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::index_writer::advance_deletes;
 use crate::indexer::merger::IndexMerger;
 use crate::indexer::segment_manager::SegmentsStatus;
-use crate::indexer::{
-    DefaultMergePolicy, MergeOperation, MergePolicy, SegmentEntry, SegmentSerializer,
-};
+use crate::indexer::{MergeOperation, SegmentEntry, SegmentSerializer};
 use crate::schema::Schema;
 use crate::{Opstamp, TantivyError};
 
@@ -98,16 +93,6 @@ impl Deref for SegmentUpdater {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
-}
-
-async fn garbage_collect_files(
-    segment_updater: SegmentUpdater,
-) -> crate::Result<GarbageCollectionResult> {
-    info!("Running garbage collection");
-    let mut index = segment_updater.index.clone();
-    index
-        .directory_mut()
-        .garbage_collect(move || segment_updater.list_files())
 }
 
 /// Merges a list of segments the list of segment givens in the `segment_entries`.
@@ -284,11 +269,8 @@ pub(crate) struct InnerSegmentUpdater {
     // This should be up to date as all update happen through
     // the unique active `SegmentUpdater`.
     active_index_meta: RwLock<Arc<IndexMeta>>,
-    pool: ThreadPool,
-
     index: Index,
     segment_manager: SegmentManager,
-    merge_policy: RwLock<Arc<dyn MergePolicy>>,
     killed: AtomicBool,
 }
 
@@ -296,67 +278,18 @@ impl SegmentUpdater {
     pub fn create(index: Index, delete_cursor: &DeleteCursor) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
-        let pool = ThreadPoolBuilder::new()
-            .name_prefix("segment_updater")
-            .pool_size(1)
-            .create()
-            .map_err(|_| {
-                crate::TantivyError::SystemError(
-                    "Failed to spawn segment updater thread".to_string(),
-                )
-            })?;
         let index_meta = index.load_metas()?;
         Ok(SegmentUpdater(Arc::new(InnerSegmentUpdater {
             active_index_meta: RwLock::new(Arc::new(index_meta)),
-            pool,
             index,
             segment_manager,
-            merge_policy: RwLock::new(Arc::new(DefaultMergePolicy::default())),
             killed: AtomicBool::new(false),
         })))
     }
 
-    pub fn get_merge_policy(&self) -> Arc<dyn MergePolicy> {
-        self.merge_policy.read().unwrap().clone()
-    }
-
-    pub fn set_merge_policy(&self, merge_policy: Box<dyn MergePolicy>) {
-        let arc_merge_policy = Arc::from(merge_policy);
-        *self.merge_policy.write().unwrap() = arc_merge_policy;
-    }
-
-    async fn schedule_task<
-        T: 'static + Send,
-        F: Future<Output = crate::Result<T>> + 'static + Send,
-    >(
-        &self,
-        task: F,
-    ) -> crate::Result<T> {
-        if !self.is_alive() {
-            return Err(crate::TantivyError::SystemError(
-                "Segment updater killed".to_string(),
-            ));
-        }
-        let (sender, receiver) = oneshot::channel();
-        self.pool.spawn_ok(async move {
-            let task_result = task.await;
-            let _ = sender.send(task_result);
-        });
-        let task_result = receiver.await;
-        task_result.unwrap_or_else(|_| {
-            let err_msg =
-                "A segment_updater future did not success. This should never happen.".to_string();
-            Err(crate::TantivyError::SystemError(err_msg))
-        })
-    }
-
-    pub async fn schedule_add_segment(&self, segment_entry: SegmentEntry) -> crate::Result<()> {
-        let segment_updater = self.clone();
-        self.schedule_task(async move {
-            segment_updater.segment_manager.add_segment(segment_entry);
-            Ok(())
-        })
-        .await
+    pub fn add_segment(&self, segment_entry: SegmentEntry) -> crate::Result<()> {
+        self.segment_manager.add_segment(segment_entry);
+        Ok(())
     }
 
     /// Orders `SegmentManager` to remove all segments
@@ -423,9 +356,13 @@ impl SegmentUpdater {
         Ok(())
     }
 
-    pub async fn schedule_garbage_collect(&self) -> crate::Result<GarbageCollectionResult> {
-        let garbage_collect_future = garbage_collect_files(self.clone());
-        self.schedule_task(garbage_collect_future).await
+    pub async fn garbage_collect(&self) -> crate::Result<GarbageCollectionResult> {
+        info!("Running garbage collection");
+        let mut index = self.index.clone();
+        let segment_updater = self.clone();
+        index
+            .directory_mut()
+            .garbage_collect(move || segment_updater.list_files())
     }
 
     /// List the files that are useful to the index.
@@ -443,19 +380,15 @@ impl SegmentUpdater {
         files
     }
 
-    pub(crate) async fn schedule_commit(
+    pub(crate) async fn commit(
         &self,
         opstamp: Opstamp,
         payload: Option<String>,
     ) -> crate::Result<()> {
-        let segment_updater: SegmentUpdater = self.clone();
-        self.schedule_task(async move {
-            let segment_entries = segment_updater.purge_deletes(opstamp)?;
-            segment_updater.segment_manager.commit(segment_entries);
-            segment_updater.save_metas(opstamp, payload)?;
-            Ok(())
-        })
-        .await
+        let segment_entries = self.purge_deletes(opstamp)?;
+        self.segment_manager.commit(segment_entries);
+        self.save_metas(opstamp, payload)?;
+        Ok(())
     }
 
     fn store_meta(&self, index_meta: &IndexMeta) {
@@ -525,7 +458,6 @@ mod tests {
     use crate::collector::TopDocs;
     use crate::directory::RamDirectory;
     use crate::fastfield::AliveBitSet;
-    use crate::indexer::merge_policy::tests::MergeWheneverPossible;
     use crate::indexer::merger::IndexMerger;
     use crate::indexer::segment_updater::merge_filtered_segments;
     use crate::query::QueryParser;
@@ -540,7 +472,6 @@ mod tests {
 
         // writing the segment
         let mut index_writer = index.writer_for_tests()?;
-        index_writer.set_merge_policy(Box::new(MergeWheneverPossible));
 
         for _ in 0..100 {
             index_writer.add_document(doc!(text_field=>"a"))?;

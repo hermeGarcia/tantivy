@@ -211,7 +211,6 @@ mod tests {
 
     use super::*;
     use crate::directory::{CompositeFile, Directory, RamDirectory, WritePtr};
-    use crate::merge_policy::NoMergePolicy;
     use crate::schema::{Document, Field, NumericOptions, Schema, FAST};
     use crate::{Index, SegmentId, SegmentReader};
 
@@ -488,7 +487,6 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer_for_tests().unwrap();
-        index_writer.set_merge_policy(Box::new(NoMergePolicy));
         index_writer.add_document(doc!(date_field =>crate::chrono::prelude::Utc::now()))?;
         index_writer.commit()?;
         index_writer.add_document(doc!())?;
@@ -524,7 +522,6 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer_for_tests()?;
-        index_writer.set_merge_policy(Box::new(NoMergePolicy));
         index_writer.add_document(doc!(
             date_field => crate::DateTime::from_u64(1i64.to_u64()),
             multi_date_field => crate::DateTime::from_u64(2i64.to_u64()),
