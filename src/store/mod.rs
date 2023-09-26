@@ -55,8 +55,6 @@ pub mod tests {
 
     use std::path::Path;
 
-    use futures::executor::block_on;
-
     use super::*;
     use crate::directory::{Directory, RamDirectory, WritePtr};
     use crate::fastfield::AliveBitSet;
@@ -316,8 +314,7 @@ pub mod tests {
         {
             let segment_ids = index.searchable_segment_ids()?;
             let mut index_writer = index.writer_for_tests()?;
-            block_on(index_writer.merge(&segment_ids))?;
-            index_writer.wait_merging_threads()?;
+            index_writer.merge(&segment_ids)?;
         }
 
         let searcher = index.reader()?.searcher();

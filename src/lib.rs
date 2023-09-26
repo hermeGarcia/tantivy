@@ -935,8 +935,6 @@ pub mod tests {
     // motivated by #729
     #[test]
     fn test_update_via_delete_insert() -> crate::Result<()> {
-        use futures::executor::block_on;
-
         use crate::collector::Count;
         use crate::indexer::NoMergePolicy;
         use crate::query::AllQuery;
@@ -990,7 +988,7 @@ pub mod tests {
             .iter()
             .map(|reader| reader.segment_id())
             .collect();
-        block_on(index_writer.merge(&segment_ids)).unwrap();
+        index_writer.merge(&segment_ids).unwrap();
 
         index_reader.reload()?;
         let searcher = index_reader.searcher();
@@ -1017,7 +1015,7 @@ pub mod tests {
         writer.delete_term(Term::from_field_text(body, "foo"));
         writer.commit()?;
         let segment_ids = index.searchable_segment_ids()?;
-        let _ = futures::executor::block_on(writer.merge(&segment_ids));
+        let _ = writer.merge(&segment_ids);
 
         assert!(index.validate_checksum()?.is_empty());
         Ok(())

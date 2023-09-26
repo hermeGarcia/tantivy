@@ -6,7 +6,6 @@ use std::thread::JoinHandle;
 use common::BitSet;
 use crossbeam::channel;
 use futures::executor::block_on;
-use futures::future::Future;
 use smallvec::smallvec;
 
 use super::operation::{AddOperation, UserOperation};
@@ -299,8 +298,7 @@ impl IndexWriter {
 
         let stamper = Stamper::new(current_opstamp);
 
-        let segment_updater =
-            SegmentUpdater::create(index.clone(), stamper.clone(), &delete_queue.cursor())?;
+        let segment_updater = SegmentUpdater::create(index.clone(), &delete_queue.cursor())?;
 
         let mut index_writer = IndexWriter {
             _directory_lock: Some(directory_lock),
@@ -335,33 +333,6 @@ impl IndexWriter {
     /// Accessor to the index.
     pub fn index(&self) -> &Index {
         &self.index
-    }
-
-    /// If there are some merging threads, blocks until they all finish their work and
-    /// then drop the `IndexWriter`.
-    pub fn wait_merging_threads(mut self) -> crate::Result<()> {
-        // this will stop the indexing thread,
-        // dropping the last reference to the segment_updater.
-        self.drop_sender();
-
-        let former_workers_handles = std::mem::take(&mut self.workers_join_handle);
-        for join_handle in former_workers_handles {
-            join_handle
-                .join()
-                .map_err(|_| error_in_index_worker_thread("Worker thread panicked."))?
-                .map_err(|_| error_in_index_worker_thread("Worker thread failed."))?;
-        }
-
-        let result = self
-            .segment_updater
-            .wait_merging_thread()
-            .map_err(|_| error_in_index_worker_thread("Failed to join merging thread."));
-
-        if let Err(ref e) = result {
-            error!("Some merging thread failed {:?}", e);
-        }
-
-        result
     }
 
     #[doc(hidden)]
@@ -513,22 +484,8 @@ impl IndexWriter {
         Ok(self.committed_opstamp)
     }
 
-    /// Merges a given list of segments
-    ///
-    /// `segment_ids` is required to be non-empty.
-    pub fn merge(
-        &mut self,
-        segment_ids: &[SegmentId],
-    ) -> impl Future<Output = crate::Result<SegmentMeta>> {
-        let merge_operation = self.segment_updater.make_merge_operation(segment_ids);
-        let segment_updater = self.segment_updater.clone();
-        async move { segment_updater.start_merge(merge_operation)?.await }
-    }
-
-    /// Merges a given list of segments bypassing the future thread pool.
-    /// This function is needed for use cases where the index has an async executor on top.
-    /// `segment_ids` is required to be non-empty.
-    pub fn sync_merge(&mut self, segment_ids: &[SegmentId]) -> crate::Result<()> {
+    /// Merges a given list of segments bypassing in the calling thread
+    pub fn merge(&mut self, segment_ids: &[SegmentId]) -> crate::Result<()> {
         if !segment_ids.is_empty() {
             let merge_operation = self.segment_updater.make_merge_operation(segment_ids);
             self.segment_updater.force_merge(merge_operation)?;
@@ -792,7 +749,6 @@ impl Drop for IndexWriter {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use futures::executor::block_on;
     use proptest::prelude::*;
     use proptest::prop_oneof;
     use proptest::strategy::Strategy;
@@ -1055,7 +1011,7 @@ mod tests {
         assert!(before_merge.len() > 1);
 
         // Force merging currently available segments
-        index_writer.sync_merge(&before_merge).unwrap();
+        index_writer.merge(&before_merge).unwrap();
         reader.reload()?;
 
         // The resulting index has the same data in only one segment.
@@ -1090,7 +1046,7 @@ mod tests {
         }
         //  this should create 8 segments and trigger a merge.
         index_writer.commit()?;
-        index_writer.wait_merging_threads()?;
+        index_writer.merge(&index.searchable_segment_ids()?)?;
         reader.reload()?;
         assert_eq!(num_docs_containing("a"), 200);
         assert!(index.searchable_segments()?.len() < 8);
@@ -1503,8 +1459,7 @@ mod tests {
                         .searchable_segment_ids()
                         .expect("Searchable segments failed.");
                     if segment_ids.len() >= 2 {
-                        block_on(index_writer.merge(&segment_ids)).unwrap();
-                        assert!(index_writer.segment_updater().wait_merging_thread().is_ok());
+                        index_writer.merge(&segment_ids).unwrap();
                     }
                 }
             }
@@ -1513,14 +1468,12 @@ mod tests {
 
         let searcher = index.reader()?.searcher();
         if force_end_merge {
-            index_writer.wait_merging_threads()?;
             let mut index_writer = index.writer_for_tests()?;
             let segment_ids = index
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
             if segment_ids.len() >= 2 {
-                block_on(index_writer.merge(&segment_ids)).unwrap();
-                assert!(index_writer.wait_merging_threads().is_ok());
+                index_writer.merge(&segment_ids).unwrap();
             }
         }
 
@@ -1649,45 +1602,6 @@ mod tests {
             }
         }
         Ok(())
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(20))]
-        #[test]
-        fn test_delete_with_sort_proptest_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], true, false).is_ok());
-        }
-        #[test]
-        fn test_delete_without_sort_proptest_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], false, false).is_ok());
-        }
-        #[test]
-        fn test_delete_with_sort_proptest_with_merge_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], true, true).is_ok());
-        }
-        #[test]
-        fn test_delete_without_sort_proptest_with_merge_adding(ops in proptest::collection::vec(adding_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], false, true).is_ok());
-        }
-
-        #[test]
-        fn test_delete_with_sort_proptest(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
-            assert!(test_operation_strategy(&ops[..], true, false).is_ok());
-        }
-        #[test]
-        fn test_delete_without_sort_proptest(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
-            assert!(test_operation_strategy(&ops[..], false, false).is_ok());
-        }
-        #[test]
-        fn test_delete_with_sort_proptest_with_merge(ops in proptest::collection::vec(balanced_operation_strategy(), 1..10)) {
-            assert!(test_operation_strategy(&ops[..], true, true).is_ok());
-        }
-        #[test]
-        fn test_delete_without_sort_proptest_with_merge(ops in proptest::collection::vec(balanced_operation_strategy(), 1..100)) {
-            assert!(test_operation_strategy(&ops[..], false, true).is_ok());
-        }
-
-
     }
 
     #[test]

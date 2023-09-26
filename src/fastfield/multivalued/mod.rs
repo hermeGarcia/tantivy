@@ -8,7 +8,6 @@ pub use self::writer::MultiValuedFastFieldWriter;
 mod tests {
 
     use chrono::Duration;
-    use futures::executor::block_on;
     use proptest::strategy::Strategy;
     use proptest::{prop_oneof, proptest};
     use test_log::test;
@@ -268,8 +267,7 @@ mod tests {
                 IndexingOp::Merge => {
                     let segment_ids = index.searchable_segment_ids()?;
                     if segment_ids.len() >= 2 {
-                        block_on(index_writer.merge(&segment_ids))?;
-                        index_writer.segment_updater().wait_merging_thread()?;
+                        index_writer.merge(&segment_ids)?;
                     }
                 }
             }
@@ -283,8 +281,7 @@ mod tests {
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
             if !segment_ids.is_empty() {
-                block_on(index_writer.merge(&segment_ids)).unwrap();
-                assert!(index_writer.wait_merging_threads().is_ok());
+                index_writer.merge(&segment_ids).unwrap();
             }
         }
         Ok(())

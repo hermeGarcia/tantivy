@@ -295,7 +295,6 @@ mod tests {
             writer.add_document(doc!(field => i))?;
         }
         writer.commit()?;
-        writer.wait_merging_threads()?;
 
         drop(warmer1);
 

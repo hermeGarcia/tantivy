@@ -1,30 +1,4 @@
-use std::collections::HashSet;
-use std::ops::Deref;
-
-use crate::{Inventory, Opstamp, SegmentId, TrackedObject};
-
-#[derive(Default)]
-pub(crate) struct MergeOperationInventory(Inventory<InnerMergeOperation>);
-
-impl Deref for MergeOperationInventory {
-    type Target = Inventory<InnerMergeOperation>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl MergeOperationInventory {
-    pub fn segment_in_merge(&self) -> HashSet<SegmentId> {
-        let mut segment_in_merge = HashSet::default();
-        for merge_op in self.list() {
-            for &segment_id in &merge_op.segment_ids {
-                segment_in_merge.insert(segment_id);
-            }
-        }
-        segment_in_merge
-    }
-}
+use crate::{Opstamp, SegmentId};
 
 /// A `MergeOperation` has two roles.
 /// It carries all of the information required to describe a merge:
@@ -40,34 +14,23 @@ impl MergeOperationInventory {
 /// merge candidates, we simply list tracked merge operations and remove
 /// their segments from possible merge candidates.
 pub struct MergeOperation {
-    inner: TrackedObject<InnerMergeOperation>,
-}
-
-pub(crate) struct InnerMergeOperation {
     target_opstamp: Opstamp,
     segment_ids: Vec<SegmentId>,
 }
 
 impl MergeOperation {
-    pub(crate) fn new(
-        inventory: &MergeOperationInventory,
-        target_opstamp: Opstamp,
-        segment_ids: Vec<SegmentId>,
-    ) -> MergeOperation {
-        let inner_merge_operation = InnerMergeOperation {
+    pub(crate) fn new(target_opstamp: Opstamp, segment_ids: Vec<SegmentId>) -> MergeOperation {
+        MergeOperation {
             target_opstamp,
             segment_ids,
-        };
-        MergeOperation {
-            inner: inventory.track(inner_merge_operation),
         }
     }
 
     pub fn target_opstamp(&self) -> Opstamp {
-        self.inner.target_opstamp
+        self.target_opstamp
     }
 
     pub fn segment_ids(&self) -> &[SegmentId] {
-        &self.inner.segment_ids[..]
+        &self.segment_ids[..]
     }
 }

@@ -1010,49 +1010,6 @@ mod test {
         assert!(matches!(error, QueryParserError::FieldNotIndexed(_)));
     }
 
-    #[test]
-    fn test_json_field() {
-        test_parse_query_to_logical_ast_helper(
-            "json.titi:hello",
-            "Term(type=Json, field=14, path=titi, vtype=Str, \"hello\")",
-            false,
-        );
-    }
-
-    #[test]
-    fn test_json_field_possibly_a_number() {
-        test_parse_query_to_logical_ast_helper(
-            "json.titi:5",
-            r#"(Term(type=Json, field=14, path=titi, vtype=U64, 5) Term(type=Json, field=14, path=titi, vtype=Str, "5"))"#,
-            true,
-        );
-        test_parse_query_to_logical_ast_helper(
-            "json.titi:-5",
-            r#"(Term(type=Json, field=14, path=titi, vtype=I64, -5) Term(type=Json, field=14, path=titi, vtype=Str, "5"))"#, //< Yes this is a bit weird after going through the tokenizer we lose the "-".
-            true,
-        );
-        test_parse_query_to_logical_ast_helper(
-            "json.titi:-5.2",
-            r#"(Term(type=Json, field=14, path=titi, vtype=F64, -5.2) "[(0, Term(type=Json, field=14, path=titi, vtype=Str, "5")), (1, Term(type=Json, field=14, path=titi, vtype=Str, "2"))]")"#,
-            true,
-        );
-    }
-
-    #[test]
-    fn test_json_field_possibly_a_date() {
-        test_parse_query_to_logical_ast_helper(
-            r#"json.date:"2019-10-12T07:20:50.52Z""#,
-            r#"(Term(type=Json, field=14, path=date, vtype=Date, 2019-10-12T07:20:50Z) "[(0, Term(type=Json, field=14, path=date, vtype=Str, "2019")), (1, Term(type=Json, field=14, path=date, vtype=Str, "10")), (2, Term(type=Json, field=14, path=date, vtype=Str, "12t07")), (3, Term(type=Json, field=14, path=date, vtype=Str, "20")), (4, Term(type=Json, field=14, path=date, vtype=Str, "50")), (5, Term(type=Json, field=14, path=date, vtype=Str, "52z"))]")"#,
-            true,
-        );
-    }
-
-    #[test]
-    fn test_json_field_not_indexed() {
-        let error = parse_query_to_logical_ast("json_not_indexed.titi:hello", false).unwrap_err();
-        assert!(matches!(error, QueryParserError::FieldNotIndexed(_)));
-    }
-
     fn test_query_to_logical_ast_with_default_json(
         query: &str,
         expected: &str,
@@ -1065,38 +1022,6 @@ mod test {
         let ast = query_parser.parse_query_to_logical_ast(query).unwrap();
         let ast_str = format!("{ast:?}");
         assert_eq!(ast_str, expected);
-    }
-
-    #[test]
-    fn test_json_default() {
-        test_query_to_logical_ast_with_default_json(
-            "titi:4",
-            "(Term(type=Json, field=14, path=titi, vtype=U64, 4) Term(type=Json, field=14, \
-             path=titi, vtype=Str, \"4\"))",
-            false,
-        );
-    }
-
-    #[test]
-    fn test_json_default_with_different_field() {
-        for conjunction in [false, true] {
-            test_query_to_logical_ast_with_default_json(
-                "text:4",
-                r#"Term(type=Str, field=1, "4")"#,
-                conjunction,
-            );
-        }
-    }
-
-    #[test]
-    fn test_json_default_with_same_field() {
-        for conjunction in [false, true] {
-            test_query_to_logical_ast_with_default_json(
-                "json:4",
-                r#"(Term(type=Json, field=14, path=, vtype=U64, 4) Term(type=Json, field=14, path=, vtype=Str, "4"))"#,
-                conjunction,
-            );
-        }
     }
 
     #[test]

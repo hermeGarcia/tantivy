@@ -597,7 +597,9 @@ mod tests {
                 index_writer.commit()?;
                 reader.reload()?;
             }
-            index_writer.wait_merging_threads()?;
+
+            let pre_merge_segments = index.searchable_segment_ids()?;
+            index_writer.merge(&pre_merge_segments)?;
 
             reader.reload()?;
             let num_segments = reader.searcher().segment_readers().len();

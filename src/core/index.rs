@@ -794,7 +794,9 @@ mod tests {
             .try_into()?;
 
         assert_eq!(reader.searcher().num_docs(), 8_000);
-        writer.wait_merging_threads()?;
+        let segments = index.searchable_segment_ids()?;
+        writer.merge(&segments)?;
+        futures::executor::block_on(writer.garbage_collect_files())?;
         let mem_right_after_merge_finished = directory.total_mem_usage();
 
         reader.reload().unwrap();
