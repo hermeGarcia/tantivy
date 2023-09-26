@@ -380,11 +380,7 @@ impl SegmentUpdater {
         files
     }
 
-    pub(crate) async fn commit(
-        &self,
-        opstamp: Opstamp,
-        payload: Option<String>,
-    ) -> crate::Result<()> {
+    pub(crate) fn commit(&self, opstamp: Opstamp, payload: Option<String>) -> crate::Result<()> {
         let segment_entries = self.purge_deletes(opstamp)?;
         self.segment_manager.commit(segment_entries);
         self.save_metas(opstamp, payload)?;
