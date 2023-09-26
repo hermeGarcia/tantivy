@@ -356,7 +356,7 @@ impl SegmentUpdater {
         Ok(())
     }
 
-    pub async fn garbage_collect(&self) -> crate::Result<GarbageCollectionResult> {
+    pub fn garbage_collect(&self) -> crate::Result<GarbageCollectionResult> {
         info!("Running garbage collection");
         let mut index = self.index.clone();
         let segment_updater = self.clone();
