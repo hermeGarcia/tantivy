@@ -98,6 +98,7 @@ pub struct SegmentRangeCollector {
 }
 
 impl SegmentRangeCollector {
+    #[allow(missing_docs)]
     pub fn into_intermediate_bucket_result(self) -> IntermediateBucketResult {
         let field_type = self.field_type;
 

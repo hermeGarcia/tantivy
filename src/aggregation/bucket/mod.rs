@@ -9,5 +9,4 @@
 
 mod range;
 
-pub(crate) use range::SegmentRangeCollector;
 pub use range::*;
